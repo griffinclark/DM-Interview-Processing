@@ -1206,6 +1206,13 @@ def inject_styles() -> None:
             box-shadow: 0 14px 26px rgba(15, 23, 32, 0.08);
         }
 
+        .provider-card.is-disabled {
+            opacity: 0.48;
+            background: rgba(239, 229, 214, 0.68);
+            border-color: rgba(57, 73, 91, 0.14);
+            box-shadow: none;
+        }
+
         .provider-mark {
             position: relative;
             width: 44px;
@@ -1239,6 +1246,10 @@ def inject_styles() -> None:
         .provider-mark-anthropic {
             color: #3c2916;
             background: linear-gradient(145deg, rgba(255, 247, 233, 0.92), rgba(235, 213, 185, 0.98));
+        }
+
+        .provider-card.is-disabled .provider-logo-image {
+            filter: grayscale(1);
         }
 
         .provider-copy {
