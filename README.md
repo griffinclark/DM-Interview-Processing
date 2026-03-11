@@ -1,91 +1,59 @@
 # HollyPlanner
 
-HollyPlanner is a locked-workbook intake app for financial planners. It turns planner-facing PDF financial plans into the exact Excel model shipped in this repository, keeps the workbook structure on rails, and gives reviewers a resumable import flow instead of a one-shot black box.
+HollyPlanner is a Streamlit app that turns a planner-facing PDF financial plan into the locked Excel workbook shipped in this repository. The app is intentionally template-specific: it verifies the bundled workbook checksum before every run and fails final validation if the output workbook drifts outside the allowed write surface.
 
-The current build is a three-stage pipeline:
+## Current Behavior
+
+The current build runs a three-step pipeline:
 
 1. OCR
-2. Workbook Entry
-3. Financial Calculations
+   - Renders PDF pages locally with PyMuPDF.
+   - Extracts structured page evidence through the configured LLM client.
+   - Processes pages across parallel lanes with retries, heartbeat updates, and shared cooldown handling after rate limits.
+2. Workbook entry
+   - Uses a LangGraph agent to fill sheets in this order: `Data Input`, `Net Worth`, `Expenses`, `Retirement Accounts`, `Taxable Accounts`, `Education Accounts`.
+   - Always prioritizes `Data Input` first.
+   - Rebuilds the workbook from canonical assignments after each sheet pass so later sheets read current workbook state, not stale prompt state.
+   - Pauses behind a planner-facing question when ambiguity still blocks a supported target.
+   - Supports resume with either a human answer or an explicit "let the agent decide" handoff.
+3. Final review
+   - Rebuilds the workbook from the locked template plus canonical assignments.
+   - Attempts LibreOffice recalculation when `soffice` is available.
+   - Checks output formula counts against the locked template baseline.
+   - Runs structural drift checks against the locked template.
 
-LangGraph-driven sheet entry, deterministic workbook writes, resumable question handling, and workbook validation all live in one Streamlit surface.
+Additional runtime rules that matter:
 
-## License
+- `Transactions Raw` is preserved in the workbook and is never prompt-dumped by default.
+- On the `Expenses` sheet, the agent gets a read-only `query_transactions` tool backed by an in-memory SQLite view of `Transactions Raw`.
+- The agent only writes to whitelisted cells and row blocks defined in code.
+- A run is only marked successful when workbook validation passes and coverage rules pass.
+- Current coverage gates are `MIN_SUPPORTED_COVERAGE=0.70` and `MAX_UNRESOLVED_SUPPORTED_TARGETS=10`.
+- Current critical sheets for review gating are `Data Input` and `Expenses`.
 
-This repository is intentionally **non-commercial only** for interview and evaluation use.
+## UI State
 
-- License notice: [LICENSE](/Users/griffin/Desktop/DM Interview Processing/LICENSE)
-- Required notice: [NOTICE](/Users/griffin/Desktop/DM Interview Processing/NOTICE)
+The Streamlit UI currently exposes:
 
-If you need commercial rights, you must secure a separate written license from the copyright holder.
+- A custom shell with sticky top-level workflow chrome.
+- Live OCR lane status, retry countdowns, and workbook-entry heartbeats.
+- A planner question surface that appears inline when the run pauses.
+- A run settings dialog that only exposes the OCR parallel-lane count for the current browser session.
+- Final result states of `Workbook ready` or `Review required` after finalization.
 
-## What It Does Now
+One important detail: the UI shows two top-level workflow stages, `Document review` and `Workbook entry`. The underlying `Financial Calculations` step runs inside the workbook stage view as the final review phase.
 
-- Uses the exact workbook template at [assets/template/Copy of FP Case Study Model - Alicia and Tom Smith - March 5, 10_01 AM.xlsx](/Users/griffin/Desktop/DM Interview Processing/assets/template/Copy%20of%20FP%20Case%20Study%20Model%20-%20Alicia%20and%20Tom%20Smith%20-%20March%205,%2010_01%E2%80%AFAM.xlsx)
-- Verifies the locked template SHA-256 before every run
-- Renders PDF pages locally with PyMuPDF and runs OCR across parallel lanes with retries, heartbeat updates, and shared cooldown handling after rate limits
-- Fills the workbook one sheet at a time with a LangGraph agent that prioritizes `Data Input`, carries forward prior writes, and only writes to whitelisted cells and row blocks
-- Uses staged evidence escalation during workbook entry: workbook context first, structured OCR next, raw-PDF rereview last, then a user-facing decision gate only if ambiguity still remains
-- Gives the `Expenses` sheet a read-only `query_transactions` tool over `Transactions Raw`, exposed as an in-memory SQLite dataset so the agent can inspect or aggregate ledger rows without flooding the prompt window
-- Keeps `Transactions Raw` out of preloaded prompt context by default to preserve tokens while still preserving that sheet in the workbook output
-- Persists resumable job artifacts so a paused run can continue after a user answer or an explicit "let the agent decide" handoff
-- Rebuilds the workbook from canonical assignments after each sheet pass so downstream sheets see current workbook state instead of stale context
-- Preserves formulas, styles, sheet order, named ranges, validations, and layout
-- Runs formula-count validation plus structural drift checks before declaring success
-- Applies review gates based on unresolved critical sheets, minimum supported coverage, and unresolved-target count
-- Produces a detailed `review_report.json` with warnings, assignments, assumptions, questions asked, user answers, coverage summary, drift results, and calculation validation results
-- Streams live status in a custom Streamlit shell with sticky stage chrome, rate-limit countdowns, agent progress heartbeats, and downloadable final artifacts
+## Requirements
 
-## End-to-End Flow
+- Python 3 with `venv`
+- An `OPENAI_API_KEY` for the current default UI/runtime path
+- Optional: `soffice` on your local machine if you want LibreOffice-based recalculation during final review
 
-### 1. OCR
-
-- The app verifies the locked template, renders the uploaded PDF, and fans OCR work out across `N` parallel lanes.
-- Lanes refill immediately as pages complete, so shorter pages do not leave workers idle.
-- Retry events are surfaced with cooldown timing and provider-specific messaging.
-
-### 2. Workbook Entry
-
-- A LangGraph sheet-entry agent walks the template in sheet order, with `Data Input` pulled to the front.
-- The agent starts with workbook-native context when possible, escalates to structured OCR when needed, and only falls back to raw OCR text for a final targeted rereview.
-- If a sheet is still materially ambiguous, the run pauses behind a "Decision Gate" question instead of silently guessing.
-- Resuming supports both explicit human answers and agent delegation.
-- For `Expenses`, the agent can query `Transactions Raw` through the read-only `query_transactions` tool instead of relying on prompt-dumped sample rows.
-
-### 3. Financial Calculations
-
-- The output workbook is rebuilt from canonical assignments.
-- LibreOffice recalculation is attempted when `soffice` is available; otherwise the workbook is left for Excel recalc-on-open.
-- Formula counts are checked against the locked template baseline.
-- Structural drift is checked against the template so unsupported sheet/layout edits fail hard.
-- Final success requires both a valid workbook and acceptable coverage.
-
-## Output Artifacts
-
-Each run creates a job directory under `tmp/jobs/<job_id>/` containing:
-
-- The source PDF
-- `filled_financial_plan.xlsx`
-- `ocr_results.json`
-- `entry_state.json`
-- `review_report.json`
-
-The persisted `entry_state.json` and `ocr_results.json` are what make paused workbook-entry sessions resumable.
-
-## Streamlit UI
-
-The UI is no longer a bare upload form. The current app includes:
-
-- A custom Streamlit shell with a sticky taskbar that shows current stage, status tone, and stage completion
-- Live OCR/retry countdowns rendered via a small HTML bridge instead of static timestamps
-- A dedicated workbook-entry question surface for human clarification and agent-delegation resumes
-- Download actions for both the filled workbook and the review report
-- A runtime settings dialog for per-session OCR lane count changes
-- Provider branding in the UI, while still keeping provider credentials in `.env`
+Anthropic runtime plumbing and tests still exist in the codebase, but the settings dialog forces OpenAI in this build. If you want Anthropic end-to-end, you need to change the code, not just `.env`.
 
 ## Local Setup
 
-Create and use the project virtual environment:
+Create and activate the virtual environment:
 
 ```bash
 python3 -m venv .venv
@@ -94,27 +62,30 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Set up the environment file:
+Create the local environment file:
 
 ```bash
 cp example.env .env
 ```
 
-Then edit `.env` and replace the placeholder with your real API key. The app loads `example.env` first and overrides it with `.env` when present.
+`example.env` is loaded first and `.env` overrides it when present.
 
 Minimum `.env`:
 
 ```bash
-OPENAI_API_KEY="your-real-openai-key"
+OPENAI_API_KEY=replace-me
 ```
 
-Optional Anthropic entry:
+Run the app:
 
 ```bash
-# ANTHROPIC_API_KEY="your-anthropic-key"
+source .venv/bin/activate
+.venv/bin/streamlit run app.py
 ```
 
-Runtime settings stay locked in code, and the UI currently exposes only the OCR parallel-worker count for the current browser session. Current defaults:
+## Runtime Defaults
+
+These defaults are currently locked in code in [`planlock/config.py`](planlock/config.py):
 
 ```bash
 LLM_PROVIDER="openai"
@@ -131,16 +102,26 @@ MAX_UNRESOLVED_SUPPORTED_TARGETS="10"
 LOG_LEVEL="INFO"
 ```
 
-Anthropic support still exists in the runtime plumbing, but this build keeps OpenAI active in the UI. If you want to switch providers, add `ANTHROPIC_API_KEY` to `.env` and change the default provider in code.
+The only runtime setting currently exposed in the UI is `OCR_PARALLEL_WORKERS`, and that change applies only to the current browser session.
 
-The locked template path and checksum stay in code and are not exposed in the settings dialog.
+## Artifacts
 
-Run locally:
+Every job gets a directory under `tmp/jobs/<job_id>/`.
 
-```bash
-source .venv/bin/activate
-.venv/bin/streamlit run app.py
-```
+Artifact timing is important:
+
+- The uploaded source PDF is copied into the job directory at job start.
+- `filled_financial_plan.xlsx` is created when workbook entry is initialized by copying the locked template.
+- `ocr_results.json` is written after OCR completes successfully.
+- `entry_state.json` is written when workbook entry starts and is updated as the run advances or pauses.
+- `review_report.json` is only written after the run reaches final review.
+
+That means a paused or early-failed run can have a valid job directory without a final `review_report.json`.
+
+UI download behavior is also conditional:
+
+- `review_report.json` is downloadable after finalization.
+- `filled_financial_plan.xlsx` is only offered as a download when the workbook passes formula and drift validation, even though a working workbook file may still exist on disk in the job directory.
 
 ## Docker
 
@@ -150,41 +131,19 @@ Build the image:
 docker build -t hollyplanner .
 ```
 
-Start the container with the local `.env` file:
+Run it with your local `.env`:
 
 ```bash
 docker run --rm -p 8501:8501 --env-file .env hollyplanner
 ```
 
-Then open `http://localhost:8501` in your browser.
+Then open [http://localhost:8501](http://localhost:8501).
 
-If you prefer to pass variables explicitly instead of using `--env-file`:
-
-```bash
-docker run --rm -p 8501:8501 \
-  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
-  hollyplanner
-```
-
-If you do not already have `.env`, create it from the template before starting the container:
-
-```bash
-cp example.env .env
-```
-
-Then edit `.env` and set:
-
-```bash
-OPENAI_API_KEY="your-real-openai-key"
-```
-
-To run with Anthropic instead, also pass `-e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"` and change the default provider in code before starting the app.
-
-The container includes LibreOffice so the app can attempt a headless recalculation pass during stage 3.
+The Docker image installs LibreOffice, so the container can attempt headless recalculation during final review.
 
 ## Testing
 
-Run the test suite from the project virtual environment:
+Run the test suite from the virtual environment:
 
 ```bash
 source .venv/bin/activate
@@ -193,16 +152,29 @@ source .venv/bin/activate
 
 The current tests cover:
 
-- LangGraph sheet-entry behavior, including workbook-only vs OCR escalation and raw-PDF rereview
+- Job-runner stage flow, OCR concurrency, retries, token/progress heartbeats, and resumable question handling
+- LangGraph sheet-entry behavior, including workbook-context-first prompting, structured OCR escalation, and raw-PDF rereview
 - The `query_transactions` tool and its read-only SQL guardrails
-- Resumable job flow after workbook-entry questions
-- Coverage-based review gating
-- Workbook write behavior and drift detection
-- Streamlit UI rendering for taskbar, countdowns, provider rail, and question/resume handling
+- Workbook writes, preserved formula surfaces, and template drift detection
+- Streamlit UI rendering, settings behavior, result/download states, and HTML-rendering helper usage
 
-## Notes For Reviewers
+## Repository Assets
 
-- HollyPlanner is **template-specific by design**. It intentionally rejects alternate workbook layouts.
-- Missing or ambiguous PDF data is left unresolved and surfaced for review instead of being guessed into the workbook.
-- `Transactions Raw` is preserved as workbook data but is not dumped into prompt context by default; the agent accesses it through a tool when it needs ledger detail.
-- Structural workbook drift is treated as a hard failure.
+- Locked workbook template: `assets/template/Copy of FP Case Study Model - Alicia and Tom Smith - March 5, 10_01 AM.xlsx`
+- Sample PDF: `assets/samples/Domain Money Mock Financial Plan.pdf`
+
+## Review Notes
+
+- HollyPlanner is template-specific by design and is not a general workbook mapper.
+- `Transactions Raw` is kept as workbook data but is treated as a read-only evidence source.
+- Missing or ambiguous PDF data is surfaced for review instead of being silently guessed into the workbook.
+- Structural workbook drift is treated as a hard validation failure.
+
+## License
+
+This repository is noncommercial only.
+
+- License: [`LICENSE`](LICENSE)
+- Required notice: [`NOTICE`](NOTICE)
+
+If you need commercial rights, you need a separate written license from the copyright holder.
