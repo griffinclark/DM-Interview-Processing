@@ -92,15 +92,26 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
 pip install -r requirements.txt
+```
+
+Set up the environment file:
+
+```bash
 cp example.env .env
 ```
 
-Then update `.env` with your real API key. The app loads `example.env` first and overrides it with `.env` when present.
+Then edit `.env` and replace the placeholder with your real API key. The app loads `example.env` first and overrides it with `.env` when present.
 
-Required environment variables:
+Minimum `.env`:
 
 ```bash
-OPENAI_API_KEY="your-key"
+OPENAI_API_KEY="your-real-openai-key"
+```
+
+Optional Anthropic entry:
+
+```bash
+# ANTHROPIC_API_KEY="your-anthropic-key"
 ```
 
 Runtime settings stay locked in code, and the UI currently exposes only the OCR parallel-worker count for the current browser session. Current defaults:
@@ -133,13 +144,38 @@ source .venv/bin/activate
 
 ## Docker
 
-Build and run:
+Build the image:
 
 ```bash
 docker build -t hollyplanner .
+```
+
+Start the container with the local `.env` file:
+
+```bash
+docker run --rm -p 8501:8501 --env-file .env hollyplanner
+```
+
+Then open `http://localhost:8501` in your browser.
+
+If you prefer to pass variables explicitly instead of using `--env-file`:
+
+```bash
 docker run --rm -p 8501:8501 \
   -e OPENAI_API_KEY="$OPENAI_API_KEY" \
   hollyplanner
+```
+
+If you do not already have `.env`, create it from the template before starting the container:
+
+```bash
+cp example.env .env
+```
+
+Then edit `.env` and set:
+
+```bash
+OPENAI_API_KEY="your-real-openai-key"
 ```
 
 To run with Anthropic instead, also pass `-e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"` and change the default provider in code before starting the app.
