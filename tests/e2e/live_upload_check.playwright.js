@@ -22,7 +22,7 @@ async (page) => {
 
   if (outcome === "run-failed") {
     const bodyText = (await page.locator("body").textContent()) || "";
-    throw new Error(`PlanLock surfaced a failure state.\n\n${bodyText}`);
+    throw new Error(`HollyPlanner surfaced a failure state.\n\n${bodyText}`);
   }
 
   const workbookButton = page.getByRole("button", { name: "Download filled workbook" });
