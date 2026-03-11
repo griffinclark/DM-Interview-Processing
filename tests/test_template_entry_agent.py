@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from openpyxl import Workbook
+
 import planlock.template_entry_agent as entry_agent_module
 from planlock.models import (
     AgentQuestion,
@@ -11,7 +13,11 @@ from planlock.models import (
     SheetEntryResult,
     ValueKind,
 )
-from planlock.template_entry_agent import LangGraphTemplateEntryAgent, answer_from_question
+from planlock.template_entry_agent import (
+    LangGraphTemplateEntryAgent,
+    answer_from_question,
+    read_sheet_context,
+)
 
 
 class FakeGraph:
@@ -123,17 +129,18 @@ def test_invoke_structured_with_retries_uses_shared_retry_helper(monkeypatch) ->
     observed: dict[str, object] = {}
 
     class FakeLLM:
-        def invoke(self, *, schema, messages, operation_name=None):
+        def invoke(self, *, schema, messages, operation_name=None, timeout_seconds=None):
             observed["schema"] = schema
             observed["messages"] = messages
             observed["operation_name"] = operation_name
+            observed["timeout_seconds"] = timeout_seconds
             return SheetEntryResult(sheet_name="Data Input")
 
     def fake_invoke_with_retries(settings, operation_name, invoke_fn, retry_notifier=None):
         observed["settings"] = settings
         observed["operation_name"] = operation_name
         observed["retry_notifier"] = retry_notifier
-        return invoke_fn()
+        return invoke_fn(90.0)
 
     monkeypatch.setattr(entry_agent_module, "invoke_with_retries", fake_invoke_with_retries)
 
@@ -155,3 +162,25 @@ def test_invoke_structured_with_retries_uses_shared_retry_helper(monkeypatch) ->
     assert observed["operation_name"] == "Workbook entry for Data Input"
     assert observed["retry_notifier"] is notifier
     assert observed["messages"] == ["message"]
+
+
+def test_read_sheet_context_includes_all_populated_cells(monkeypatch, tmp_path: Path) -> None:
+    workbook_path = tmp_path / "output.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Data Input"
+    for row_number in range(1, 206):
+        sheet[f"A{row_number}"] = f"Value {row_number}"
+    workbook.save(workbook_path)
+
+    monkeypatch.setitem(
+        entry_agent_module.ALLOWED_WRITE_CELLS_BY_SHEET,
+        "Data Input",
+        {f"A{row_number}" for row_number in range(1, 206)},
+    )
+
+    context = read_sheet_context(workbook_path, "Data Input")
+
+    assert "- A1 = Value 1" in context
+    assert "- A205 = Value 205" in context
+    assert len(context.splitlines()) == 206

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+from planlock.throttle import RequestThrottleCoordinator
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -97,6 +99,11 @@ class Settings:
     entry_state_name: str = "entry_state.json"
     min_supported_coverage: float = DEFAULT_MIN_SUPPORTED_COVERAGE
     max_unresolved_supported_targets: int = DEFAULT_MAX_UNRESOLVED_SUPPORTED_TARGETS
+    request_throttle: RequestThrottleCoordinator = field(
+        default_factory=RequestThrottleCoordinator,
+        compare=False,
+        repr=False,
+    )
 
     @classmethod
     def from_env(cls) -> "Settings":

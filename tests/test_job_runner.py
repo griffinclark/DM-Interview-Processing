@@ -42,6 +42,10 @@ class FakeRateLimitError(Exception):
     status_code = 429
 
 
+class SilentRateLimitError(Exception):
+    status_code = 429
+
+
 class TrackingTemplateEntryAgent:
     def __init__(self) -> None:
         self.sheet_calls: list[str] = []
@@ -171,6 +175,20 @@ class RetryingTemplateEntryAgent(TrackingTemplateEntryAgent):
                 FakeRateLimitError(
                     "Error code: 429 - {'type': 'error', 'error': {'type': 'rate_limit_error'}}"
                 ),
+            )
+        time.sleep(0.2)
+        return super().advance(state, ocr_results, retry_notifier=retry_notifier)
+
+
+class SilentRetryingTemplateEntryAgent(TrackingTemplateEntryAgent):
+    def advance(self, state, ocr_results, retry_notifier=None):
+        if retry_notifier is not None:
+            retry_notifier(
+                "Workbook entry for Data Input",
+                2,
+                7,
+                10.0,
+                SilentRateLimitError("HTTP 429"),
             )
         time.sleep(0.2)
         return super().advance(state, ocr_results, retry_notifier=retry_notifier)
@@ -418,6 +436,27 @@ def test_job_runner_surfaces_workbook_rate_limit_retries(tmp_path: Path) -> None
     assert "rate_limit_error" in str(retry_events[0].detail_message)
 
 
+def test_job_runner_classifies_status_code_429_as_rate_limit_without_text(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    runner = JobRunner(
+        settings,
+        extraction_client=FakeExtractionClient(),
+        entry_agent=SilentRetryingTemplateEntryAgent(),
+    )
+
+    events = list(runner.run(_make_pdf_bytes(), "test.pdf"))
+    retry_events = [
+        event
+        for event in events
+        if event.stage == Stage.DATA_ENTRY and event.phase == "retry"
+    ]
+
+    assert retry_events
+    assert retry_events[0].retry_reason == "rate_limit"
+    assert "OpenAI rate limit hit while filling Data Input." in retry_events[0].message
+    assert retry_events[0].detail_message == "Workbook entry for Data Input: HTTP 429"
+
+
 def test_retry_event_keeps_raw_error_in_detail_message() -> None:
     retry_queue: Queue[dict[str, object]] = Queue()
     retry_queue.put(
@@ -437,6 +476,32 @@ def test_retry_event_keeps_raw_error_in_detail_message() -> None:
     assert len(events) == 1
     assert events[0].message == "Restarting lane 1 for page 1/23 (pass 2/3) after 2.0s."
     assert events[0].detail_message == "OCR page 1: 1 validation error for PageOcrResult"
+
+
+def test_timeout_retry_event_mentions_escalated_timeout() -> None:
+    retry_queue: Queue[dict[str, object]] = Queue()
+    retry_queue.put(
+        {
+            "page_number": 1,
+            "pipe_number": 1,
+            "attempt_number": 2,
+            "max_attempts": 3,
+            "retry_delay_seconds": 0.0,
+            "detail_message": "OCR page 1: request timed out after 60.0s",
+            "retry_reason": "timeout",
+            "current_timeout_seconds": 60.0,
+            "next_timeout_seconds": 90.0,
+        }
+    )
+
+    events = list(JobRunner._drain_retry_queue(retry_queue, completed_pages=0, total_pages=23, pipe_total=3))
+
+    assert len(events) == 1
+    assert (
+        events[0].message
+        == "Page 1/23 in lane 1 exceeded the 60s processing limit. Retrying immediately with 90s timeout (pass 2/3)."
+    )
+    assert events[0].retry_reason == "timeout"
 
 
 def test_job_runner_raises_sanitized_page_failure(tmp_path: Path) -> None:

@@ -284,6 +284,6 @@ class RunEvent(BaseModel):
     attempt_number: int | None = None
     max_attempts: int | None = None
     retry_delay_seconds: float | None = None
-    retry_reason: Literal["rate_limit", "transient"] | None = None
+    retry_reason: Literal["rate_limit", "timeout", "transient"] | None = None
     phase: Literal["start", "retry", "complete", "failed", "heartbeat", "paused"] | None = None
     artifacts: ImportArtifacts | None = None

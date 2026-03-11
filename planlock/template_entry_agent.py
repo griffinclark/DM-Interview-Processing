@@ -119,7 +119,7 @@ def read_sheet_context(
             continue
         populated_lines.append(f"- {cell_ref} = {value}")
     if populated_lines:
-        lines.extend(populated_lines[:200])
+        lines.extend(populated_lines)
     else:
         lines.append("- No writable cells are populated yet.")
     return "\n".join(lines)
@@ -197,10 +197,11 @@ class LangGraphTemplateEntryAgent:
         return invoke_with_retries(
             self._settings,
             operation_name,
-            lambda: self._llm.invoke(
+            lambda timeout_seconds: self._llm.invoke(
                 schema=schema,
                 messages=messages,
                 operation_name=operation_name,
+                timeout_seconds=timeout_seconds,
             ),
             retry_notifier=retry_notifier,
         )

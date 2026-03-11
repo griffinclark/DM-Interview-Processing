@@ -13,10 +13,12 @@ from planlock.calculations import run_calculation_validation
 from planlock.canonicalizer import merge_page_mappings
 from planlock.config import Settings
 from planlock.llm_pipeline import (
+    describe_retry_error,
     ExtractionClient,
     OpenAICompatibleExtractionClient,
     RetryNotifier,
     is_rate_limit_error,
+    retry_reason_for_error,
 )
 from planlock.models import (
     EntrySessionState,
@@ -114,10 +116,27 @@ class JobRunner:
             retry_delay_seconds = float(payload["retry_delay_seconds"])
             detail_message = str(payload["detail_message"])
             retry_reason = str(payload.get("retry_reason", "transient"))
+            current_timeout_seconds = payload.get("current_timeout_seconds")
+            next_timeout_seconds = payload.get("next_timeout_seconds")
             if retry_reason == "rate_limit":
                 message = (
                     f"{provider_label} rate limit hit on page {page_number}/{total_pages} in lane {pipe_number}. "
                     f"Cooling down for {retry_delay_seconds:.1f}s before pass {attempt_number}/{max_attempts}."
+                )
+            elif retry_reason == "timeout":
+                current_timeout_label = (
+                    f"{float(current_timeout_seconds):.0f}s"
+                    if isinstance(current_timeout_seconds, (int, float))
+                    else "the current"
+                )
+                next_timeout_label = (
+                    f"{float(next_timeout_seconds):.0f}s"
+                    if isinstance(next_timeout_seconds, (int, float))
+                    else "a higher"
+                )
+                message = (
+                    f"Page {page_number}/{total_pages} in lane {pipe_number} exceeded the {current_timeout_label} processing limit. "
+                    f"Retrying immediately with {next_timeout_label} timeout (pass {attempt_number}/{max_attempts})."
                 )
             else:
                 message = (
@@ -138,7 +157,11 @@ class JobRunner:
                 attempt_number=attempt_number,
                 max_attempts=max_attempts,
                 retry_delay_seconds=retry_delay_seconds,
-                retry_reason="rate_limit" if retry_reason == "rate_limit" else "transient",
+                retry_reason=(
+                    "rate_limit"
+                    if retry_reason == "rate_limit"
+                    else "timeout" if retry_reason == "timeout" else "transient"
+                ),
                 phase="retry",
             )
 
@@ -171,10 +194,27 @@ class JobRunner:
             retry_delay_seconds = float(payload["retry_delay_seconds"])
             detail_message = str(payload["detail_message"])
             retry_reason = str(payload.get("retry_reason", "transient"))
+            current_timeout_seconds = payload.get("current_timeout_seconds")
+            next_timeout_seconds = payload.get("next_timeout_seconds")
             if retry_reason == "rate_limit":
                 message = (
                     f"{provider_label} rate limit hit while filling {current_sheet_name}. "
                     f"Resuming pass {attempt_number}/{max_attempts} in {retry_delay_seconds:.1f}s."
+                )
+            elif retry_reason == "timeout":
+                current_timeout_label = (
+                    f"{float(current_timeout_seconds):.0f}s"
+                    if isinstance(current_timeout_seconds, (int, float))
+                    else "the current"
+                )
+                next_timeout_label = (
+                    f"{float(next_timeout_seconds):.0f}s"
+                    if isinstance(next_timeout_seconds, (int, float))
+                    else "a higher"
+                )
+                message = (
+                    f"{current_sheet_name} exceeded the {current_timeout_label} processing limit. "
+                    f"Retrying immediately with {next_timeout_label} timeout (pass {attempt_number}/{max_attempts})."
                 )
             else:
                 message = (
@@ -191,7 +231,11 @@ class JobRunner:
                 attempt_number=attempt_number,
                 max_attempts=max_attempts,
                 retry_delay_seconds=retry_delay_seconds,
-                retry_reason="rate_limit" if retry_reason == "rate_limit" else "transient",
+                retry_reason=(
+                    "rate_limit"
+                    if retry_reason == "rate_limit"
+                    else "timeout" if retry_reason == "timeout" else "transient"
+                ),
                 phase="retry",
             )
 
@@ -269,12 +313,10 @@ class JobRunner:
                             "attempt_number": attempt_number,
                             "max_attempts": max_attempts,
                             "retry_delay_seconds": retry_delay_seconds,
-                            "detail_message": f"{operation_name}: {error}",
-                            "retry_reason": (
-                                "rate_limit"
-                                if "rate_limit_error" in str(error).lower() or "rate limit" in str(error).lower()
-                                else "transient"
-                            ),
+                            "detail_message": f"{operation_name}: {describe_retry_error(error)}",
+                            "retry_reason": retry_reason_for_error(error),
+                            "current_timeout_seconds": getattr(error, "planlock_timeout_seconds", None),
+                            "next_timeout_seconds": getattr(error, "planlock_next_timeout_seconds", None),
                         }
                     )
 
@@ -615,8 +657,10 @@ class JobRunner:
                         "attempt_number": attempt_number,
                         "max_attempts": max_attempts,
                         "retry_delay_seconds": retry_delay_seconds,
-                        "detail_message": f"{operation_name}: {error}",
-                        "retry_reason": "rate_limit" if is_rate_limit_error(error) else "transient",
+                        "detail_message": f"{operation_name}: {describe_retry_error(error)}",
+                        "retry_reason": retry_reason_for_error(error),
+                        "current_timeout_seconds": getattr(error, "planlock_timeout_seconds", None),
+                        "next_timeout_seconds": getattr(error, "planlock_next_timeout_seconds", None),
                     }
                 )
 

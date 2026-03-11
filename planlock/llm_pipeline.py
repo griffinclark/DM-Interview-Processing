@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
+from email.utils import parsedate_to_datetime
+import re
 import time
 from collections.abc import Callable
 from typing import Any, Protocol, TypeVar
@@ -19,16 +21,35 @@ from planlock.template_schema import schema_reference_for_prompt
 
 T = TypeVar("T")
 RetryNotifier = Callable[[str, int, int, float, Exception], None]
+THROTTLE_RESET_HEADER_NAMES = (
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-reset-tokens",
+)
+PAGE_PROCESS_TIMEOUT_SCHEDULE_SECONDS = (60.0, 90.0, 120.0)
+NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 422}
+COMPOSITE_DURATION_PATTERN = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h|d)")
+SECONDS_PER_DURATION_UNIT = {
+    "ms": 0.001,
+    "s": 1.0,
+    "m": 60.0,
+    "h": 3600.0,
+    "d": 86400.0,
+}
 
 
 OCR_SYSTEM_PROMPT = """
 You are an OCR and layout-aware extraction engine for planner-facing financial plan PDFs.
+Your output is used downstream to populate a locked Excel workbook for financial planners, so extract only page-supported facts that can be mapped or reviewed later.
 Read the supplied page image and native PDF text together.
 
 Rules:
-- Extract only what is directly visible on the page.
+- Extract only what is directly visible on the current page.
+- Focus on planner-relevant content such as household names, dates, balances, income, expenses, savings targets, debts, account details, holdings, recommendations, assumptions, action items, and any current vs. proposed or target values.
 - Preserve qualifiers such as current, suggested, target, required, annual, monthly, or one-time.
+- Extract tables as tables when row and column structure is visible.
+- Pull usable data out of charts and graphs, including titles, legends, labels, axes, time periods, categories, and plotted values or comparisons. Represent that information in figures and tables whenever possible.
 - Capture recommendations and TODO items separately from numeric figures.
+- If native text and the image disagree, trust the image.
 - Do not infer hidden rows, spreadsheet values, or unstated household details.
 - Return structured output only.
 """.strip()
@@ -53,42 +74,148 @@ Rules:
 
 
 def status_code(exc: Exception) -> int | None:
-    for value in (
-        getattr(exc, "status_code", None),
-        getattr(exc, "status", None),
-        getattr(getattr(exc, "response", None), "status_code", None),
-        getattr(getattr(exc, "response", None), "status", None),
-    ):
-        if isinstance(value, int):
-            return value
-        if isinstance(value, str) and value.isdigit():
-            return int(value)
+    for error in iter_exception_chain(exc):
+        for value in (
+            getattr(error, "status_code", None),
+            getattr(error, "status", None),
+            getattr(getattr(error, "response", None), "status_code", None),
+            getattr(getattr(error, "response", None), "status", None),
+        ):
+            if isinstance(value, int):
+                return value
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
     return None
+
+
+def iter_exception_chain(exc: Exception):
+    seen: set[int] = set()
+    current: Exception | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def error_text(exc: Exception) -> str:
+    return " ".join(str(error).lower() for error in iter_exception_chain(exc))
+
+
+def response_headers(exc: Exception) -> dict[str, str]:
+    for error in iter_exception_chain(exc):
+        for headers in (
+            getattr(error, "headers", None),
+            getattr(getattr(error, "response", None), "headers", None),
+        ):
+            if not hasattr(headers, "items"):
+                continue
+            return {
+                str(key).strip().lower(): str(value).strip()
+                for key, value in headers.items()
+            }
+    return {}
+
+
+def is_quota_exhaustion_error(exc: Exception) -> bool:
+    message = error_text(exc)
+    return status_code(exc) == 429 and (
+        "insufficient_quota" in message
+        or "exceeded your current quota" in message
+        or "billing details" in message
+    )
 
 
 def is_rate_limit_error(exc: Exception) -> bool:
-    error_text = str(exc).lower()
-    return status_code(exc) == 429 or "rate_limit_error" in error_text or "rate limit" in error_text
+    if is_quota_exhaustion_error(exc):
+        return False
+    message = error_text(exc)
+    return status_code(exc) == 429 or "rate_limit_error" in message or "rate limit" in message
 
 
-def retry_after_seconds(exc: Exception) -> float | None:
-    header_sources = [
-        getattr(exc, "headers", None),
-        getattr(getattr(exc, "response", None), "headers", None),
-    ]
-    for headers in header_sources:
-        if headers is None:
-            continue
-        for key, value in headers.items():
-            if str(key).lower() != "retry-after":
-                continue
-            try:
-                retry_after = float(value)
-            except (TypeError, ValueError):
-                continue
-            if retry_after > 0:
-                return retry_after
+def is_throttle_error(exc: Exception) -> bool:
+    if is_rate_limit_error(exc):
+        return True
+    message = error_text(exc)
+    return status_code(exc) == 503 and (
+        "slow down" in message
+        or "reduce your request rate" in message
+        or "temporarily overloaded" in message
+    )
+
+
+def is_timeout_error(exc: Exception) -> bool:
+    message = error_text(exc)
+    exception_name = type(exc).__name__.lower()
+    timeout_markers = (
+        "timed out",
+        "timeout",
+        "readtimeout",
+        "writetimeout",
+        "connecttimeout",
+        "deadline exceeded",
+        "apitimeouterror",
+    )
+    return isinstance(exc, TimeoutError) or any(
+        marker in message or marker in exception_name for marker in timeout_markers
+    )
+
+
+def is_non_retryable_error(exc: Exception) -> bool:
+    if is_quota_exhaustion_error(exc):
+        return True
+    return status_code(exc) in NON_RETRYABLE_STATUS_CODES
+
+
+def retry_reason_for_error(exc: Exception) -> str:
+    if is_throttle_error(exc):
+        return "rate_limit"
+    if is_timeout_error(exc):
+        return "timeout"
+    return "transient"
+
+
+def parse_retry_after_seconds(value: str) -> float | None:
+    try:
+        retry_after = float(value)
+    except (TypeError, ValueError):
+        try:
+            parsed = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        retry_after = parsed.timestamp() - time.time()
+    if retry_after > 0:
+        return retry_after
     return None
+
+
+def parse_duration_seconds(value: str) -> float | None:
+    text = value.strip().lower().replace(" ", "")
+    if not text:
+        return None
+    try:
+        numeric = float(text)
+    except ValueError:
+        matches = list(COMPOSITE_DURATION_PATTERN.finditer(text))
+        if not matches or "".join(match.group(0) for match in matches) != text:
+            return None
+        duration_seconds = 0.0
+        for match in matches:
+            duration_seconds += float(match.group(1)) * SECONDS_PER_DURATION_UNIT[match.group(2)]
+        return duration_seconds if duration_seconds > 0 else None
+    return numeric if numeric > 0 else None
+
+
+def throttle_reset_seconds(exc: Exception) -> float | None:
+    headers = response_headers(exc)
+    candidates: list[float] = []
+    retry_after = parse_retry_after_seconds(headers.get("retry-after", ""))
+    if retry_after is not None:
+        candidates.append(retry_after)
+    for header_name in THROTTLE_RESET_HEADER_NAMES:
+        reset_value = parse_duration_seconds(headers.get(header_name, ""))
+        if reset_value is not None:
+            candidates.append(reset_value)
+    return max(candidates, default=None)
 
 
 def backoff_seconds(settings: Settings, exc: Exception, attempt: int) -> float:
@@ -96,10 +223,10 @@ def backoff_seconds(settings: Settings, exc: Exception, attempt: int) -> float:
         settings.llm_retry_base_seconds * (2 ** (attempt - 1)),
         settings.llm_retry_max_seconds,
     )
-    if not is_rate_limit_error(exc):
+    if not is_throttle_error(exc):
         return exponential_backoff
 
-    retry_after = retry_after_seconds(exc)
+    retry_after = throttle_reset_seconds(exc)
     if retry_after is not None:
         return min(
             max(exponential_backoff, retry_after),
@@ -120,32 +247,101 @@ def rate_limit_max_attempts(settings: Settings, base_max_attempts: int) -> int:
     return max(base_max_attempts, retry_attempts + 1)
 
 
+def page_process_timeout_seconds(attempt: int) -> float:
+    safe_attempt = max(1, attempt)
+    return PAGE_PROCESS_TIMEOUT_SCHEDULE_SECONDS[
+        min(safe_attempt - 1, len(PAGE_PROCESS_TIMEOUT_SCHEDULE_SECONDS) - 1)
+    ]
+
+
+def attach_timeout_metadata(
+    exc: Exception,
+    *,
+    current_timeout_seconds: float,
+    next_timeout_seconds: float | None,
+) -> None:
+    try:
+        setattr(exc, "planlock_timeout_seconds", current_timeout_seconds)
+        setattr(exc, "planlock_next_timeout_seconds", next_timeout_seconds)
+    except Exception:  # noqa: BLE001
+        return
+
+
+def timeout_seconds_from_error(exc: Exception, *, attr_name: str) -> float | None:
+    value = getattr(exc, attr_name, None)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def describe_retry_error(exc: Exception | None) -> str:
+    if exc is None:
+        return "unknown error"
+    if not is_timeout_error(exc):
+        return str(exc)
+
+    timeout_seconds = timeout_seconds_from_error(exc, attr_name="planlock_timeout_seconds")
+    timeout_copy = (
+        f"request timed out after {timeout_seconds:.1f}s"
+        if timeout_seconds is not None
+        else "request timed out"
+    )
+    original = str(exc).strip()
+    if not original:
+        return timeout_copy
+    if timeout_copy.lower() in original.lower():
+        return original
+    return f"{timeout_copy}: {original}"
+
+
 def invoke_with_retries(
     settings: Settings,
     operation_name: str,
-    invoke_fn: Callable[[], T],
+    invoke_fn: Callable[[float], T],
     retry_notifier: RetryNotifier | None = None,
 ) -> T:
-    base_max_attempts = max(1, settings.llm_max_retries + 1)
+    base_max_attempts = len(PAGE_PROCESS_TIMEOUT_SCHEDULE_SECONDS)
     rate_limit_attempts = rate_limit_max_attempts(settings, base_max_attempts)
     last_error: Exception | None = None
+    max_attempts = base_max_attempts
     attempt = 0
 
     while True:
         attempt += 1
+        request_timeout_seconds = page_process_timeout_seconds(attempt)
+        settings.request_throttle.wait_for_availability()
         try:
-            return invoke_fn()
+            return invoke_fn(request_timeout_seconds)
         except Exception as exc:  # noqa: BLE001
             last_error = exc
-            max_attempts = rate_limit_attempts if is_rate_limit_error(exc) else base_max_attempts
+            if is_non_retryable_error(exc):
+                max_attempts = attempt
+                break
+            if is_throttle_error(exc):
+                max_attempts = rate_limit_attempts
+            else:
+                max_attempts = base_max_attempts
+            if is_timeout_error(exc):
+                attach_timeout_metadata(
+                    exc,
+                    current_timeout_seconds=request_timeout_seconds,
+                    next_timeout_seconds=(
+                        page_process_timeout_seconds(attempt + 1)
+                        if attempt < max_attempts
+                        else None
+                    ),
+                )
             if attempt >= max_attempts:
                 break
-            delay_seconds = backoff_seconds(settings, exc, attempt)
+            delay_seconds = 0.0 if is_timeout_error(exc) else backoff_seconds(settings, exc, attempt)
+            if is_throttle_error(exc):
+                settings.request_throttle.impose_cooldown(delay_seconds)
             if retry_notifier is not None:
                 retry_notifier(operation_name, attempt + 1, max_attempts, delay_seconds, exc)
-            time.sleep(delay_seconds)
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
     raise RuntimeError(
-        f"{operation_name} failed after {max_attempts} attempt(s): {last_error}"
+        f"{operation_name} failed after {max_attempts} attempt(s): {describe_retry_error(last_error)}"
     ) from last_error
 
 
@@ -167,25 +363,26 @@ class StructuredOutputClient:
         if self._provider == LLM_PROVIDER_OPENAI:
             if not settings.openai_api_key:
                 raise ValueError("OPENAI_API_KEY is required to run PlanLock with provider 'openai'.")
-            self._llm = ChatOpenAI(
-                model=self._model,
-                temperature=0,
-                max_tokens=4096,
-                timeout=settings.llm_timeout_seconds,
-                max_retries=0,
-                api_key=settings.openai_api_key,
-            )
         else:
             if not settings.anthropic_api_key:
                 raise ValueError("ANTHROPIC_API_KEY is required to run PlanLock with provider 'anthropic'.")
-            self._llm = ChatAnthropic(
+
+    def _build_llm(self, *, timeout_seconds: float):
+        if self._provider == LLM_PROVIDER_OPENAI:
+            return ChatOpenAI(
                 model=self._model,
                 temperature=0,
-                max_tokens=4096,
-                timeout=settings.llm_timeout_seconds,
+                timeout=timeout_seconds,
                 max_retries=0,
-                anthropic_api_key=settings.anthropic_api_key,
+                api_key=self._settings.openai_api_key,
             )
+        return ChatAnthropic(
+            model=self._model,
+            temperature=0,
+            timeout=timeout_seconds,
+            max_retries=0,
+            anthropic_api_key=self._settings.anthropic_api_key,
+        )
 
     def invoke(
         self,
@@ -193,8 +390,10 @@ class StructuredOutputClient:
         schema: type[BaseModel],
         messages: list[Any],
         operation_name: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> BaseModel:
-        runnable = self._llm.with_structured_output(schema).with_config(
+        llm = self._build_llm(timeout_seconds=timeout_seconds or self._settings.llm_timeout_seconds)
+        runnable = llm.with_structured_output(schema).with_config(
             {
                 "run_name": operation_name or f"PlanLock {schema.__name__}",
                 "tags": self._tags,
@@ -247,7 +446,7 @@ class ProviderExtractionClient:
     def _invoke_with_retries(
         self,
         operation_name: str,
-        invoke_fn: Callable[[], T],
+        invoke_fn: Callable[[float], T],
         retry_notifier: RetryNotifier | None = None,
     ) -> T:
         return invoke_with_retries(
@@ -267,8 +466,9 @@ class ProviderExtractionClient:
     ) -> PageOcrResult:
         prompt = (
             f"Page number: {page.page_number}\n"
-            "Use the native text as a hint, but trust the image for layout and tables.\n\n"
-            f"Native PDF text:\n{page.native_text[:12000]}"
+            "This OCR output will be used to populate a locked planner workbook, so prioritize structured financial facts, recommendations, tables, and chart or graph values.\n"
+            "Use the native text as a hint, but trust the image for layout, tables, charts, and graphs.\n\n"
+            f"Native PDF text:\n{page.native_text}"
         )
         messages = [
             SystemMessage(content=OCR_SYSTEM_PROMPT),
@@ -281,10 +481,11 @@ class ProviderExtractionClient:
         ]
         return self._invoke_with_retries(
             operation_name=f"OCR page {page.page_number}",
-            invoke_fn=lambda: self._ocr_llm.invoke(
+            invoke_fn=lambda timeout_seconds: self._ocr_llm.invoke(
                 schema=PageOcrResult,
                 messages=messages,
                 operation_name=f"OCR page {page.page_number}",
+                timeout_seconds=timeout_seconds,
             ),
             retry_notifier=retry_notifier,
         )
@@ -303,10 +504,11 @@ class ProviderExtractionClient:
         ]
         return self._invoke_with_retries(
             operation_name=f"Mapping page {page.page_number}",
-            invoke_fn=lambda: self._mapping_llm.invoke(
+            invoke_fn=lambda timeout_seconds: self._mapping_llm.invoke(
                 schema=PageMappingResult,
                 messages=messages,
                 operation_name=f"Mapping page {page.page_number}",
+                timeout_seconds=timeout_seconds,
             ),
             retry_notifier=retry_notifier,
         )

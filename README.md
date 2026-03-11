@@ -20,6 +20,7 @@ If you need commercial rights, you must secure a separate written license from t
 - Uses the exact workbook template at [assets/template/Copy of FP Case Study Model - Alicia and Tom Smith - March 5, 10_01 AM.xlsx](/Users/griffin/Desktop/DM Interview Processing/assets/template/Copy%20of%20FP%20Case%20Study%20Model%20-%20Alicia%20and%20Tom%20Smith%20-%20March%205,%2010_01%E2%80%AFAM.xlsx)
 - Validates the template SHA-256 before startup
 - Runs OCR across parallel lanes with retries, immediately refilling each lane as pages finish
+- Shares OpenAI cooldown windows across lanes so retries do not keep hammering the API after a 429
 - Writes only to whitelisted workbook cells and repeating row blocks
 - Preserves formulas, styles, sheet order, named ranges, validations, and layout
 - Generates a sidecar `review_report.json` for planner review
