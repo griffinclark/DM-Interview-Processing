@@ -4,7 +4,7 @@ from pathlib import Path
 
 import planlock.streamlit_app as app
 
-from planlock.models import AgentQuestion, EntrySessionState, ImportArtifacts, SheetEntrySummary
+from planlock.models import AgentQuestion, EntrySessionState, ImportArtifacts, QuestionOption, SheetEntrySummary
 from planlock.template_entry_agent import save_entry_state
 
 
@@ -19,10 +19,19 @@ class _FormBlock:
         return False
 
 
+class _ActionFormBlock(_FormBlock):
+    def __init__(self, owner) -> None:
+        self.owner = owner
+
+    def form_submit_button(self, label="Submit", **kwargs) -> bool:
+        return self.owner.submit_responses.get(label, False)
+
+
 class _QuestionStreamlit:
     def __init__(self) -> None:
         self.session_state = {}
         self.markdown_calls: list[str] = []
+        self.rerun_calls: list[dict[str, object]] = []
 
     def markdown(self, *args, **kwargs) -> None:
         if args:
@@ -39,6 +48,52 @@ class _QuestionStreamlit:
 
     def text_input(self, *args, **kwargs) -> str:
         return ""
+
+    def rerun(self, *args, **kwargs) -> None:
+        self.rerun_calls.append(kwargs)
+        return None
+
+
+class _QuestionHtmlStreamlit(_QuestionStreamlit):
+    def __init__(self) -> None:
+        super().__init__()
+        self.html_calls: list[str] = []
+
+    def html(self, *args, **kwargs) -> None:
+        if args:
+            self.html_calls.append(args[0])
+
+
+class _StatefulQuestionStreamlit(_QuestionHtmlStreamlit):
+    def __init__(self) -> None:
+        super().__init__()
+        self.radio_calls: list[dict[str, object]] = []
+        self.text_input_calls: list[dict[str, object]] = []
+
+    def radio(self, label, options, index=0, **kwargs):
+        key = kwargs.get("key")
+        value = self.session_state.get(key, options[index])
+        if key is not None:
+            self.session_state[key] = value
+        self.radio_calls.append({"key": key, "value": value, "options": list(options)})
+        return value
+
+    def text_input(self, *args, **kwargs) -> str:
+        key = kwargs.get("key")
+        value = str(self.session_state.get(key, ""))
+        if key is not None:
+            self.session_state[key] = value
+        self.text_input_calls.append({"key": key, "value": value})
+        return value
+
+
+class _SubmittingQuestionStreamlit(_StatefulQuestionStreamlit):
+    def __init__(self, submit_responses: dict[str, bool]) -> None:
+        super().__init__()
+        self.submit_responses = submit_responses
+
+    def columns(self, *args, **kwargs) -> list[_ActionFormBlock]:
+        return [_ActionFormBlock(self), _ActionFormBlock(self)]
 
 
 def _entry_state(tmp_path: Path) -> EntrySessionState:
@@ -85,4 +140,196 @@ def test_render_entry_question_shows_raw_pdf_rereview_chip(monkeypatch, tmp_path
     answer, source, submitted = app.render_entry_question(result)
 
     assert (answer, source, submitted) == (None, None, False)
-    assert "Raw PDF re-reviewed" in "\n".join(fake_st.markdown_calls)
+    markup = "\n".join(fake_st.markdown_calls)
+    assert "Raw PDF re-reviewed" in markup
+    assert "Which travel target should be used?" in markup
+    assert "Affected targets" not in markup
+    assert "Last write summary" not in markup
+
+
+def test_render_entry_question_prefers_html_renderer_with_compact_modal_markup(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fake_st = _QuestionHtmlStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+
+    result = ImportArtifacts(
+        success=False,
+        job_id="job-123",
+        job_dir=tmp_path,
+        entry_state_path=None,
+        pending_question=AgentQuestion(
+            id="income-cadence",
+            sheet_name="Data Input",
+            prompt="Should the income values use paycheck, monthly, or annual amounts?",
+            rationale="The source document is ambiguous.",
+            affected_targets=["income.client_1.base_salary_gross"],
+            pdf_rereviewed=True,
+        ),
+    )
+
+    app.render_entry_question_form(result, {"progress_text": "0/7 completed • 7 remaining"}, modal=True)
+
+    assert fake_st.html_calls
+    markup = fake_st.html_calls[-1]
+    assert 'class="question-panel"' in markup
+    assert "Planner decision required" in markup
+    assert "Data Input" in markup
+    assert "0/7 completed • 7 remaining" in markup
+    assert "Affected targets" not in markup
+    assert "Last write summary" not in markup
+    assert "Current sheet" not in markup
+
+
+def test_render_entry_question_form_clears_modal_inputs_between_questions(monkeypatch, tmp_path: Path) -> None:
+    fake_st = _StatefulQuestionStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+
+    stale_widget_keys = app.entry_question_widget_keys("job-123", "prior-question")
+    fake_st.session_state[app.QUESTION_WIDGET_STATE_KEY] = {"job-123": "prior-question"}
+    fake_st.session_state[stale_widget_keys["options"]] = "Quarterly"
+    fake_st.session_state[stale_widget_keys["free_text"]] = "Legacy answer"
+
+    result = ImportArtifacts(
+        success=False,
+        job_id="job-123",
+        job_dir=tmp_path,
+        entry_state_path=None,
+        pending_question=AgentQuestion(
+            id="income-cadence",
+            sheet_name="Data Input",
+            prompt="Should the income values use monthly or annual amounts?",
+            rationale="The source document is ambiguous.",
+            affected_targets=["income.client_1.base_salary_gross"],
+            options=[
+                QuestionOption(label="Monthly", value="monthly"),
+                QuestionOption(label="Annual", value="annual"),
+            ],
+        ),
+    )
+
+    app.render_entry_question_form(result, {"progress_text": "0/7 completed • 7 remaining"}, modal=True)
+
+    current_widget_keys = app.entry_question_widget_keys("job-123", "income-cadence")
+    assert fake_st.session_state[app.QUESTION_WIDGET_STATE_KEY]["job-123"] == app.entry_question_signature(
+        result.pending_question
+    )
+    assert fake_st.session_state[current_widget_keys["options"]] == "Monthly"
+    assert fake_st.session_state[current_widget_keys["free_text"]] == ""
+    assert fake_st.radio_calls[-1]["value"] == "Monthly"
+    assert fake_st.text_input_calls[-1]["value"] == ""
+
+
+def test_render_entry_question_modal_submit_queues_answer_and_forces_app_rerun(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fake_st = _SubmittingQuestionStreamlit({"Submit answer and continue": True})
+    monkeypatch.setattr(app, "st", fake_st)
+
+    result = ImportArtifacts(
+        success=False,
+        job_id="job-123",
+        job_dir=tmp_path,
+        entry_state_path=None,
+        pending_question=AgentQuestion(
+            id="income-cadence",
+            sheet_name="Data Input",
+            prompt="Should the income values use monthly or annual amounts?",
+            rationale="The source document is ambiguous.",
+            affected_targets=["income.client_1.base_salary_gross"],
+            options=[
+                QuestionOption(label="Monthly", value="monthly"),
+                QuestionOption(label="Annual", value="annual"),
+            ],
+        ),
+    )
+
+    answer, source, submitted = app.render_entry_question_form(
+        result, {"progress_text": "0/7 completed • 7 remaining"}, modal=True
+    )
+
+    assert (answer, source, submitted) == (None, None, False)
+    assert fake_st.session_state[app.QUESTION_SUBMISSION_STATE_KEY] == {
+        "job_id": "job-123",
+        "question_signature": app.entry_question_signature(result.pending_question),
+        "answer": "monthly",
+        "source": "option",
+    }
+    assert fake_st.rerun_calls == [{"scope": "app"}]
+
+
+def test_render_entry_question_modal_delegate_queues_agent_choice_and_forces_app_rerun(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fake_st = _SubmittingQuestionStreamlit({"Figure it out": True})
+    monkeypatch.setattr(app, "st", fake_st)
+
+    result = ImportArtifacts(
+        success=False,
+        job_id="job-123",
+        job_dir=tmp_path,
+        entry_state_path=None,
+        pending_question=AgentQuestion(
+            id="income-cadence",
+            sheet_name="Data Input",
+            prompt="Should the income values use monthly or annual amounts?",
+            rationale="The source document is ambiguous.",
+            affected_targets=["income.client_1.base_salary_gross"],
+            options=[
+                QuestionOption(label="Monthly", value="monthly"),
+                QuestionOption(label="Annual", value="annual"),
+            ],
+        ),
+    )
+
+    answer, source, submitted = app.render_entry_question_form(
+        result, {"progress_text": "0/7 completed • 7 remaining"}, modal=True
+    )
+
+    assert (answer, source, submitted) == (None, None, False)
+    assert fake_st.session_state[app.QUESTION_SUBMISSION_STATE_KEY] == {
+        "job_id": "job-123",
+        "question_signature": app.entry_question_signature(result.pending_question),
+        "answer": "",
+        "source": "agent",
+    }
+    assert fake_st.rerun_calls == [{"scope": "app"}]
+
+
+def test_render_entry_question_ignores_submission_from_prior_question(monkeypatch, tmp_path: Path) -> None:
+    fake_st = _QuestionStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.setattr(app, "render_workbook_stage", lambda: None)
+
+    prior_question = AgentQuestion(
+        id="prior-question",
+        sheet_name="Data Input",
+        prompt="Use monthly amounts?",
+        rationale="The source document is ambiguous.",
+        affected_targets=["income.client_1.base_salary_gross"],
+    )
+    fake_st.session_state[app.QUESTION_SUBMISSION_STATE_KEY] = {
+        "job_id": "job-123",
+        "question_signature": app.entry_question_signature(prior_question),
+        "answer": "Legacy answer",
+        "source": "free_text",
+    }
+
+    result = ImportArtifacts(
+        success=False,
+        job_id="job-123",
+        job_dir=tmp_path,
+        entry_state_path=None,
+        pending_question=AgentQuestion(
+            id="income-cadence",
+            sheet_name="Data Input",
+            prompt="Should the income values use monthly or annual amounts?",
+            rationale="The source document is ambiguous.",
+            affected_targets=["income.client_1.base_salary_gross"],
+        ),
+    )
+
+    answer, source, submitted = app.render_entry_question(result)
+
+    assert (answer, source, submitted) == (None, None, False)
+    assert app.QUESTION_SUBMISSION_STATE_KEY not in fake_st.session_state

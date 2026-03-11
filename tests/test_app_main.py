@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,18 +9,24 @@ from planlock.config import Settings
 from planlock.models import (
     AgentQuestion,
     CellAssignment,
+    EntrySessionState,
+    ImportArtifacts,
     QuestionOption,
     ReviewReport,
     RunEvent,
+    SheetEntrySummary,
     Severity,
     Stage,
     ValueKind,
 )
+from planlock.template_entry_agent import save_entry_state
 
 
 class _Block:
     def __init__(self, owner=None):
         self.owner = owner
+        self.was_cleared = False
+        self.empty_count = 0
 
     def __enter__(self):
         return self
@@ -33,6 +38,8 @@ class _Block:
         return self
 
     def empty(self):
+        self.was_cleared = True
+        self.empty_count += 1
         return None
 
     def form_submit_button(self, label="Submit", **kwargs) -> bool:
@@ -61,12 +68,17 @@ class _FakeStreamlit:
         self.session_state = {}
         self.markdown_calls: list[str] = []
         self.empty_calls = 0
+        self.empty_blocks: list[_Block] = []
+        self.button_calls: list[dict[str, object]] = []
         self.dataframe_rows = None
         self.radio_value = None
         self.selectbox_value = None
         self.text_input_value = ""
         self.submit_responses: dict[str, bool] = {}
         self.button_responses: dict[str, bool] = {}
+        self.uploaded_file_value = None
+        self.dialog_calls: list[dict[str, object]] = []
+        self.rerun_called = False
 
     def markdown(self, *args, **kwargs) -> None:
         if args:
@@ -80,7 +92,9 @@ class _FakeStreamlit:
 
     def empty(self) -> _Block:
         self.empty_calls += 1
-        return _Block(self)
+        block = _Block(self)
+        self.empty_blocks.append(block)
+        return block
 
     def columns(self, *args, **kwargs) -> list[_Block]:
         if not args:
@@ -92,6 +106,9 @@ class _FakeStreamlit:
 
     def form(self, *args, **kwargs) -> _Block:
         return _Block(self)
+
+    def file_uploader(self, *args, **kwargs):
+        return self.uploaded_file_value
 
     def radio(self, label, options, index=0, **kwargs):
         if self.radio_value is not None:
@@ -117,8 +134,19 @@ class _FakeStreamlit:
         return self.submit_responses.get(label, False)
 
     def button(self, label, key=None, **kwargs) -> bool:
+        self.button_calls.append({"label": label, "key": key, **kwargs})
         lookup_key = key if key is not None else label
         return self.button_responses.get(lookup_key, False)
+
+    def dialog(self, title, **kwargs):
+        def decorator(fn):
+            def wrapped(*args, **inner_kwargs):
+                self.dialog_calls.append({"title": title, **kwargs})
+                return fn(*args, **inner_kwargs)
+
+            return wrapped
+
+        return decorator
 
     def expander(self, *args, **kwargs) -> _Block:
         return _Block(self)
@@ -136,6 +164,7 @@ class _FakeStreamlit:
         return None
 
     def rerun(self) -> None:
+        self.rerun_called = True
         return None
 
 
@@ -155,6 +184,63 @@ class _UploadedFile:
 
     def getvalue(self) -> bytes:
         return b"%PDF-1.4"
+
+
+def _persist_entry_state(tmp_path: Path) -> Path:
+    state_path = tmp_path / "entry_state.json"
+    save_entry_state(
+        state_path,
+        EntrySessionState(
+            job_id="job-123",
+            template_sha256="template-sha",
+            workbook_path=tmp_path / "output.xlsx",
+            ocr_results_path=tmp_path / "ocr_results.json",
+            current_sheet_index=1,
+            sheet_order=["Data Input", "Expenses", "Retirement Accounts"],
+            sheet_summaries=[
+                SheetEntrySummary(
+                    sheet_name="Data Input",
+                    status="completed",
+                    mapped_count=2,
+                    touched_cells=["C6", "D6"],
+                    message="Committed household names into the workbook.",
+                )
+            ],
+            mapped_assignments=[
+                CellAssignment(
+                    sheet_name="Data Input",
+                    cell="C6",
+                    value="Alicia",
+                    value_kind=ValueKind.STRING,
+                    semantic_key="profile.client_1.first_name",
+                    source_pages=[1],
+                ),
+                CellAssignment(
+                    sheet_name="Data Input",
+                    cell="D6",
+                    value="Smith",
+                    value_kind=ValueKind.STRING,
+                    semantic_key="profile.client_1.last_name",
+                    source_pages=[1],
+                ),
+            ],
+        ),
+    )
+    return state_path
+
+
+def test_inject_styles_forces_white_text_inside_primary_buttons(monkeypatch) -> None:
+    fake_st = _HtmlStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+
+    app.inject_styles()
+
+    assert fake_st.html_calls
+    markup = fake_st.html_calls[-1]
+    assert '.stButton > button[kind="primary"] *,' in markup
+    assert '.stButton > button[kind="primary"] [data-testid="stMarkdownContainer"] *,' in markup
+    assert '.stFormSubmitButton > button [data-testid="stMarkdownContainer"] * {' in markup
+    assert '-webkit-text-fill-color: #fffaf1 !important;' in markup
 
 
 def test_main_passes_settings_to_init_and_work_area(monkeypatch) -> None:
@@ -225,6 +311,140 @@ def test_append_event_ignores_heartbeat_updates_in_logs(monkeypatch) -> None:
     assert len(fake_st.session_state["logs"]) == prior_log_count
 
 
+def test_append_event_tracks_langgraph_sheet_trace(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    monkeypatch.setattr(app.time, "time", lambda: 100.0)
+
+    app.append_event(
+        RunEvent(
+            stage=Stage.DATA_ENTRY,
+            message="LangGraph is working on Data Input.",
+            sheet_name="Data Input",
+            detail_message="Reviewing OCR evidence, workbook context, and prior answers before proposing writes.",
+            stage_completed=0,
+            stage_total=7,
+            phase="start",
+        )
+    )
+
+    trace = fake_st.session_state["agent_trace"]
+    assert trace["status"] == "running"
+    assert trace["current_sheet"] == "Data Input"
+    assert "Reviewing OCR evidence" in trace["message"]
+    assert trace["started_at_ms"] == 100000
+    assert trace["recent_events"][-1]["label"] == "Now working"
+
+
+def test_append_event_tracks_live_reasoning_summary(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    observed_times = iter([100.0, 101.0])
+    monkeypatch.setattr(app.time, "time", lambda: next(observed_times))
+
+    app.append_event(
+        RunEvent(
+            stage=Stage.DATA_ENTRY,
+            message="LangGraph is working on Data Input.",
+            sheet_name="Data Input",
+            detail_message="Reviewing OCR evidence, workbook context, and prior answers before proposing writes.",
+            stage_completed=0,
+            stage_total=7,
+            phase="start",
+        )
+    )
+    app.append_event(
+        RunEvent(
+            stage=Stage.DATA_ENTRY,
+            message="Workbook entry in progress.",
+            sheet_name="Data Input",
+            progress_message="Reviewing household profile evidence.",
+            stage_completed=0,
+            stage_total=7,
+            phase="heartbeat",
+        )
+    )
+
+    trace = fake_st.session_state["agent_trace"]
+    assert trace["live_summary"] == "Reviewing household profile evidence."
+    assert trace["live_summary_updated_at_ms"] == 101000
+
+
+def test_append_event_clears_live_reasoning_summary_on_retry(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    observed_times = iter([100.0, 101.0, 102.0, 103.0])
+    monkeypatch.setattr(app.time, "time", lambda: next(observed_times))
+
+    app.append_event(
+        RunEvent(
+            stage=Stage.DATA_ENTRY,
+            message="LangGraph is working on Data Input.",
+            sheet_name="Data Input",
+            detail_message="Reviewing OCR evidence, workbook context, and prior answers before proposing writes.",
+            stage_completed=0,
+            stage_total=7,
+            phase="start",
+        )
+    )
+    app.append_event(
+        RunEvent(
+            stage=Stage.DATA_ENTRY,
+            message="Workbook entry in progress.",
+            sheet_name="Data Input",
+            progress_message="Reviewing household profile evidence.",
+            stage_completed=0,
+            stage_total=7,
+            phase="heartbeat",
+        )
+    )
+    app.append_event(
+        RunEvent(
+            stage=Stage.DATA_ENTRY,
+            message="OpenAI rate limit hit while filling Data Input. Resuming pass 2/7 in 10.0s.",
+            detail_message="Workbook entry for Data Input: HTTP 429",
+            sheet_name="Data Input",
+            retry_delay_seconds=10.0,
+            stage_completed=0,
+            stage_total=7,
+            phase="retry",
+            severity=Severity.WARNING,
+        )
+    )
+
+    trace = fake_st.session_state["agent_trace"]
+    assert trace["live_summary"] is None
+    assert trace["live_summary_updated_at_ms"] is None
+
+
+def test_append_event_preserves_workbook_failure_detail(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+
+    app.append_event(
+        RunEvent(
+            stage=Stage.DATA_ENTRY,
+            message="Workbook entry failed on Data Input.",
+            detail_message="Workbook entry for Data Input: request timed out after 120.0s",
+            severity=Severity.ERROR,
+            stage_completed=0,
+            stage_total=7,
+            sheet_name="Data Input",
+            phase="failed",
+        )
+    )
+
+    assert fake_st.session_state["last_status"]["detail_message"] == (
+        "Workbook entry for Data Input: request timed out after 120.0s"
+    )
+    assert fake_st.session_state["workbook_retry"]["phase"] == "failed"
+    assert fake_st.session_state["workbook_retry"]["sheet_name"] == "Data Input"
+
+
 def test_build_timing_markup_adds_live_countdown_target() -> None:
     markup = app.build_timing_markup("12.0s", countdown_target_ms=123456)
 
@@ -276,11 +496,10 @@ def test_render_work_area_copy_only_mentions_parallel_lanes(monkeypatch) -> None
 
     observed: dict[str, object] = {}
 
-    def fake_render_upload_panel(*, context_key, title, copy, cache_path):
+    def fake_render_upload_panel(*, context_key, title, copy):
         observed["context_key"] = context_key
         observed["title"] = title
         observed["copy"] = copy
-        observed["cache_path"] = cache_path
         return None, None
 
     monkeypatch.setattr(app, "render_upload_panel", fake_render_upload_panel)
@@ -295,6 +514,26 @@ def test_render_work_area_copy_only_mentions_parallel_lanes(monkeypatch) -> None
     assert "page limit" not in str(observed["copy"])
     assert "retry timing" not in str(observed["copy"])
     assert "models" not in str(observed["copy"])
+
+
+def test_render_upload_panel_replaces_controls_immediately_on_build_click(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    fake_st.uploaded_file_value = _UploadedFile()
+    fake_st.button_responses = {"run_import_primary": True}
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+
+    uploaded_file, run_mode = app.render_upload_panel(
+        context_key="primary",
+        title="Upload PDF",
+        copy="Start a new workbook build.",
+    )
+
+    assert uploaded_file is fake_st.uploaded_file_value
+    assert run_mode == "upload"
+    assert fake_st.empty_blocks[-1].was_cleared is True
+    assert "Starting workbook build" in fake_st.markdown_calls[-1]
+    assert [call["label"] for call in fake_st.button_calls] == ["Build workbook"]
 
 
 def test_apply_runtime_settings_forces_openai_provider(monkeypatch) -> None:
@@ -544,6 +783,41 @@ def test_render_status_uses_throttle_card_for_rate_limits(monkeypatch) -> None:
     assert 'data-countdown-target-ms="135000"' in markup
 
 
+def test_render_status_uses_timeout_card_for_workbook_timeouts(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["workbook_retry"] = {
+        "sheet_name": "Data Input",
+        "message": "Data Input exceeded the 120s processing limit. Retrying immediately with 180s timeout (pass 2/3).",
+        "detail_message": "Workbook entry for Data Input: request timed out after 120.0s",
+        "attempt_number": 2,
+        "max_attempts": 3,
+        "retry_delay_seconds": 0.0,
+        "retry_reason": "timeout",
+        "phase": "retry",
+        "severity": Severity.WARNING,
+    }
+    fake_st.session_state["last_status"] = {
+        "index": 2,
+        "stage": "Workbook entry",
+        "message": "Data Input exceeded the 120s processing limit. Retrying immediately with 180s timeout (pass 2/3).",
+        "severity": Severity.WARNING,
+        "detail_message": "Workbook entry for Data Input: request timed out after 120.0s",
+    }
+
+    placeholder = _Placeholder()
+    app.render_status(placeholder)
+
+    markup = placeholder.markdown_calls[-1]
+    assert 'class="status-card warning"' in markup
+    assert "Processing timeout" in markup
+    assert "Data Input is retrying" in markup
+    assert "request timed out after 120.0s" in markup
+    assert "Next pass" in markup
+    assert "Immediate" in markup
+
+
 def test_render_stage_progress_collapses_to_two_steps(monkeypatch) -> None:
     fake_st = _FakeStreamlit()
     monkeypatch.setattr(app, "st", fake_st)
@@ -563,7 +837,65 @@ def test_render_stage_progress_collapses_to_two_steps(monkeypatch) -> None:
     assert "Workbook entry" in markup
 
 
-def test_render_stage_focus_uses_shared_workbook_stage_ui(monkeypatch) -> None:
+def test_render_shell_chrome_keeps_chrome_in_immersive_workbook_mode(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    observed = {"masthead": 0}
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["active_stage"] = Stage.DATA_ENTRY.value
+    fake_st.session_state["is_running"] = True
+
+    def fake_render_masthead() -> bool:
+        observed["masthead"] += 1
+        return False
+
+    monkeypatch.setattr(app, "render_masthead", fake_render_masthead)
+
+    chrome_placeholder = _Block()
+    settings_clicked = app.render_shell_chrome(chrome_placeholder)
+
+    assert settings_clicked is False
+    assert chrome_placeholder.was_cleared is True
+    assert chrome_placeholder.empty_count == 1
+    assert observed == {"masthead": 1}
+
+
+def test_render_shell_chrome_clears_placeholder_before_repeat_renders(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    observed = {"masthead": 0}
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+
+    def fake_render_masthead() -> bool:
+        observed["masthead"] += 1
+        return False
+
+    monkeypatch.setattr(app, "render_masthead", fake_render_masthead)
+
+    chrome_placeholder = _Block()
+    app.render_shell_chrome(chrome_placeholder)
+    app.render_shell_chrome(chrome_placeholder)
+
+    assert chrome_placeholder.empty_count == 2
+    assert observed == {"masthead": 2}
+
+
+def test_render_shell_chrome_run_scopes_settings_button_key_on_repeat_render(monkeypatch) -> None:
+    fake_st = _HtmlStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+
+    chrome_placeholder = _Block()
+    app.render_shell_chrome(chrome_placeholder)
+    app.render_shell_chrome(chrome_placeholder)
+
+    assert [call["key"] for call in fake_st.button_calls] == [
+        "open_run_settings",
+        "open_run_settings__2",
+    ]
+
+
+def test_render_stage_focus_uses_shared_workbook_stage_ui(monkeypatch, tmp_path: Path) -> None:
     fake_st = _FakeStreamlit()
     monkeypatch.setattr(app, "st", fake_st)
     app.init_state(Settings.from_env())
@@ -579,14 +911,34 @@ def test_render_stage_focus_uses_shared_workbook_stage_ui(monkeypatch) -> None:
         "message": "Running workbook checks.",
         "severity": Severity.INFO,
     }
+    fake_st.session_state["agent_trace"] = {
+        "status": "validating",
+        "current_sheet": None,
+        "message": "Formula review is running now.",
+        "started_at_ms": 120000,
+        "retry_until_ms": None,
+        "recent_events": [
+            {"label": "Validation", "message": "Running workbook checks.", "tone": "success"},
+        ],
+    }
+    fake_st.session_state["result"] = ImportArtifacts(
+        success=False,
+        job_id="job-123",
+        job_dir=tmp_path,
+        entry_state_path=_persist_entry_state(tmp_path),
+    )
 
+    monkeypatch.setattr(app.time, "time", lambda: 121.0)
     app.render_stage_focus()
 
     markup = fake_st.markdown_calls[-1]
-    assert "Workbook entry" in markup
-    assert "LangGraph sheet entry" in markup
-    assert "Workbook validation" in markup
+    assert "immersive-workbook-shell" in markup
+    assert "Final review" in markup
     assert "Running workbook checks." in markup
+    assert "Status updates" in markup
+    assert "Checking the completed workbook" in markup
+    assert "Coming up" in markup
+    assert "Committed household names into the workbook." in markup
 
 
 def test_render_workbook_stage_shows_rate_limit_banner(monkeypatch) -> None:
@@ -611,7 +963,465 @@ def test_render_workbook_stage_shows_rate_limit_banner(monkeypatch) -> None:
     markup = fake_st.markdown_calls[-1]
     assert "OpenAI rate limit detected" in markup
     assert "Data Input is paused." in markup
-    assert "Retry in" in markup
+    assert "Pass 2/7" in markup
+    assert 'data-countdown-target-ms="135000"' in markup
+
+
+def test_render_workbook_stage_shows_timeout_banner(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["active_stage"] = Stage.DATA_ENTRY.value
+    fake_st.session_state["run_started"] = True
+    fake_st.session_state["is_running"] = True
+    fake_st.session_state["source_filename"] = "sample.pdf"
+    fake_st.session_state["workbook_retry"] = {
+        "sheet_name": "Data Input",
+        "message": "Data Input exceeded the 120s processing limit. Retrying immediately with 180s timeout (pass 2/3).",
+        "detail_message": "Workbook entry for Data Input: request timed out after 120.0s",
+        "retry_delay_seconds": 0.0,
+        "attempt_number": 2,
+        "max_attempts": 3,
+        "retry_reason": "timeout",
+        "phase": "retry",
+        "severity": Severity.WARNING,
+    }
+
+    app.render_workbook_stage()
+
+    markup = fake_st.markdown_calls[-1]
+    assert "Processing timeout" in markup
+    assert "Data Input is retrying" in markup
+    assert "request timed out after 120.0s" in markup
+    assert "Immediate" in markup
+
+
+def test_render_workbook_stage_shows_setup_shell_before_first_agent_response(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["active_stage"] = Stage.DATA_ENTRY.value
+    fake_st.session_state["run_started"] = True
+    fake_st.session_state["is_running"] = True
+    fake_st.session_state["source_filename"] = "sample.pdf"
+    fake_st.session_state["last_status"] = {
+        "index": 2,
+        "stage": "Workbook entry",
+        "message": "Preparing workbook entry.",
+        "severity": Severity.INFO,
+    }
+
+    app.render_workbook_stage()
+
+    markup = fake_st.markdown_calls[-1]
+    assert "workbook-setup-shell" in markup
+    assert "Getting the workbook ready" in markup
+    assert "Waiting for the first workbook update" in markup
+    assert "sample.pdf" in markup
+    assert 'class="workbook-setup-step-list"' in markup
+    assert "Coming up" not in markup
+
+
+def test_render_workbook_stage_setup_shell_prefers_raw_html_renderer(monkeypatch) -> None:
+    fake_st = _HtmlStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["active_stage"] = Stage.DATA_ENTRY.value
+    fake_st.session_state["run_started"] = True
+    fake_st.session_state["is_running"] = True
+    fake_st.session_state["source_filename"] = "sample.pdf"
+    fake_st.session_state["last_status"] = {
+        "index": 2,
+        "stage": "Workbook entry",
+        "message": "Preparing workbook entry.",
+        "severity": Severity.INFO,
+    }
+
+    app.render_workbook_stage()
+
+    assert fake_st.html_calls
+    markup = fake_st.html_calls[-1]
+    assert "workbook-setup-shell" in markup
+    assert "Preparing the live workbook view" in markup
+    assert "Waiting for the first workbook update" in markup
+    assert 'class="workbook-setup-step-list"' in markup
+    assert fake_st.markdown_calls == []
+
+
+def test_render_work_area_failure_copy_includes_detail(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["run_started"] = True
+    fake_st.session_state["is_running"] = False
+    fake_st.session_state["last_status"] = {
+        "index": 2,
+        "stage": "Workbook entry",
+        "message": "Run failed: Workbook entry failed on Data Input.",
+        "severity": Severity.ERROR,
+        "detail_message": "Workbook entry for Data Input: request timed out after 120.0s",
+    }
+    observed: dict[str, object] = {}
+
+    def fake_render_upload_panel(*, context_key, title, copy):
+        observed["context_key"] = context_key
+        observed["title"] = title
+        observed["copy"] = copy
+        return None, None
+
+    monkeypatch.setattr(app, "render_upload_panel", fake_render_upload_panel)
+
+    app.render_work_area(_Block(fake_st), Settings.from_env())
+
+    assert observed["context_key"] == "retry"
+    assert observed["title"] == "Run failed"
+    assert observed["copy"] == (
+        "Run failed: Workbook entry failed on Data Input. Details: "
+        "Workbook entry for Data Input: request timed out after 120.0s"
+    )
+
+
+def test_render_workbook_stage_prefers_raw_html_renderer(monkeypatch, tmp_path: Path) -> None:
+    fake_st = _HtmlStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["active_stage"] = Stage.DATA_ENTRY.value
+    fake_st.session_state["run_started"] = True
+    fake_st.session_state["is_running"] = True
+    fake_st.session_state["source_filename"] = "sample.pdf"
+    fake_st.session_state["stage_progress"][Stage.DATA_ENTRY.value] = (3, 7)
+    fake_st.session_state["stage_progress"][Stage.FINANCIAL_CALCULATIONS.value] = (0, 3)
+    fake_st.session_state["agent_trace"] = {
+        "status": "running",
+        "current_sheet": "Data Input",
+        "message": "Reviewing OCR evidence, workbook context, and prior answers before proposing writes.",
+        "token_count": 1824,
+        "started_at_ms": 120000,
+        "retry_until_ms": None,
+        "live_summary": "Reviewing the current workbook context before writing cells.",
+        "live_summary_updated_at_ms": 120500,
+        "last_rendered_summary": None,
+        "recent_events": [
+            {
+                "label": "Sheet live",
+                "message": "Reviewing OCR evidence, workbook context, and prior answers before proposing writes.",
+                "tone": "info",
+            }
+        ],
+    }
+    fake_st.session_state["result"] = ImportArtifacts(
+        success=False,
+        job_id="job-123",
+        job_dir=tmp_path,
+        entry_state_path=_persist_entry_state(tmp_path),
+    )
+
+    monkeypatch.setattr(app.time, "time", lambda: 121.0)
+    app.render_workbook_stage()
+
+    assert fake_st.html_calls
+    assert "immersive-workbook-shell" in fake_st.html_calls[-1]
+    assert "Status updates" in fake_st.html_calls[-1]
+    assert "Coming up" in fake_st.html_calls[-1]
+    assert "Committed household names into the workbook." in fake_st.html_calls[-1]
+    assert "Alicia" in fake_st.html_calls[-1]
+    assert 'class="sheet-desk-summary"' in fake_st.html_calls[-1]
+    assert "Fill workbook" in fake_st.html_calls[-1]
+    assert 'class="agent-window-status running"' in fake_st.html_calls[-1]
+    assert "Reviewing Data Input" in fake_st.html_calls[-1]
+    assert "Reasoning summary" in fake_st.html_calls[-1]
+    assert "Reviewing the current workbook context before writing cells." in fake_st.html_calls[-1]
+    assert 'data-elapsed-started-at-ms="120000"' in fake_st.html_calls[-1]
+    assert fake_st.markdown_calls == []
+
+
+def test_render_workbook_stage_falls_back_to_markdown_without_html_renderer(monkeypatch, tmp_path: Path) -> None:
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["active_stage"] = Stage.DATA_ENTRY.value
+    fake_st.session_state["run_started"] = True
+    fake_st.session_state["is_running"] = True
+    fake_st.session_state["source_filename"] = "sample.pdf"
+    fake_st.session_state["stage_progress"][Stage.DATA_ENTRY.value] = (3, 7)
+    fake_st.session_state["stage_progress"][Stage.FINANCIAL_CALCULATIONS.value] = (0, 3)
+    fake_st.session_state["agent_trace"] = {
+        "status": "running",
+        "current_sheet": "Data Input",
+        "message": "Reviewing OCR evidence, workbook context, and prior answers before proposing writes.",
+        "token_count": 1824,
+        "started_at_ms": 120000,
+        "retry_until_ms": None,
+        "live_summary": "Reviewing the current workbook context before writing cells.",
+        "live_summary_updated_at_ms": 120500,
+        "last_rendered_summary": None,
+        "recent_events": [],
+    }
+    fake_st.session_state["result"] = ImportArtifacts(
+        success=False,
+        job_id="job-123",
+        job_dir=tmp_path,
+        entry_state_path=_persist_entry_state(tmp_path),
+    )
+
+    monkeypatch.setattr(app.time, "time", lambda: 121.0)
+    app.render_workbook_stage()
+
+    assert fake_st.markdown_calls
+    assert "Reasoning summary" in fake_st.markdown_calls[-1]
+    assert "Reviewing the current workbook context before writing cells." in fake_st.markdown_calls[-1]
+
+
+def test_render_workbook_stage_roadmap_includes_all_sheets(monkeypatch, tmp_path: Path) -> None:
+    fake_st = _HtmlStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["active_stage"] = Stage.DATA_ENTRY.value
+    fake_st.session_state["run_started"] = True
+    fake_st.session_state["is_running"] = True
+    fake_st.session_state["source_filename"] = "sample.pdf"
+    fake_st.session_state["stage_progress"][Stage.DATA_ENTRY.value] = (1, 6)
+    fake_st.session_state["stage_progress"][Stage.FINANCIAL_CALCULATIONS.value] = (0, 3)
+    fake_st.session_state["agent_trace"] = {
+        "status": "running",
+        "current_sheet": "Expenses",
+        "message": "Reviewing the source material before adding workbook entries.",
+        "token_count": 0,
+        "started_at_ms": 120000,
+        "retry_until_ms": None,
+        "recent_events": [],
+    }
+
+    state_path = tmp_path / "entry_state.json"
+    save_entry_state(
+        state_path,
+        EntrySessionState(
+            job_id="job-123",
+            template_sha256="template-sha",
+            workbook_path=tmp_path / "output.xlsx",
+            ocr_results_path=tmp_path / "ocr_results.json",
+            current_sheet_index=1,
+            sheet_order=[
+                "Data Input",
+                "Expenses",
+                "Retirement Accounts",
+                "Taxable Accounts",
+                "Education Accounts",
+                "Net Worth",
+            ],
+            sheet_summaries=[
+                SheetEntrySummary(sheet_name="Data Input", status="completed", mapped_count=2),
+            ],
+        ),
+    )
+    fake_st.session_state["result"] = ImportArtifacts(
+        success=False,
+        job_id="job-123",
+        job_dir=tmp_path,
+        entry_state_path=state_path,
+    )
+
+    monkeypatch.setattr(app.time, "time", lambda: 121.0)
+    app.render_workbook_stage()
+
+    markup = fake_st.html_calls[-1]
+    for sheet_name in [
+        "Data Input",
+        "Expenses",
+        "Retirement Accounts",
+        "Taxable Accounts",
+        "Education Accounts",
+        "Net Worth",
+    ]:
+        assert sheet_name in markup
+    assert markup.count('class="sheet-queue-item') == 6
+
+
+def test_render_workbook_stage_collapses_empty_section_preview(monkeypatch, tmp_path: Path) -> None:
+    fake_st = _HtmlStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["active_stage"] = Stage.DATA_ENTRY.value
+    fake_st.session_state["run_started"] = True
+    fake_st.session_state["is_running"] = True
+    fake_st.session_state["source_filename"] = "sample.pdf"
+    fake_st.session_state["stage_progress"][Stage.DATA_ENTRY.value] = (1, 7)
+    fake_st.session_state["stage_progress"][Stage.FINANCIAL_CALCULATIONS.value] = (0, 3)
+    fake_st.session_state["agent_trace"] = {
+        "status": "running",
+        "current_sheet": "Expenses",
+        "message": "Reviewing the source material before adding workbook entries.",
+        "token_count": 0,
+        "started_at_ms": 120000,
+        "retry_until_ms": None,
+        "recent_events": [],
+    }
+    fake_st.session_state["result"] = ImportArtifacts(
+        success=False,
+        job_id="job-123",
+        job_dir=tmp_path,
+        entry_state_path=_persist_entry_state(tmp_path),
+    )
+
+    monkeypatch.setattr(app.time, "time", lambda: 121.0)
+    app.render_workbook_stage()
+
+    markup = fake_st.html_calls[-1]
+    assert "Entries will appear here" in markup
+    assert "Saved entries will appear here as soon as they are ready." in markup
+    assert "Cell B10" not in markup
+
+
+def test_render_workbook_stage_hides_stale_question_during_resume_handoff(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fake_st = _HtmlStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["active_stage"] = Stage.DATA_ENTRY.value
+    fake_st.session_state["run_started"] = True
+    fake_st.session_state["is_running"] = True
+    fake_st.session_state["source_filename"] = "sample.pdf"
+    fake_st.session_state["stage_progress"][Stage.DATA_ENTRY.value] = (1, 7)
+    fake_st.session_state["stage_progress"][Stage.FINANCIAL_CALCULATIONS.value] = (0, 3)
+    fake_st.session_state["agent_trace"] = {
+        "status": "running",
+        "current_sheet": "Expenses",
+        "message": "Letting the agent resolve the outstanding section and continue workbook entry.",
+        "token_count": 0,
+        "started_at_ms": 120000,
+        "retry_until_ms": None,
+        "recent_events": [],
+    }
+    question = AgentQuestion(
+        id="expenses-monthly-totals",
+        sheet_name="Expenses",
+        prompt="Please provide the monthly totals by expense line item.",
+        rationale="The transactions tab still needs category cleanup.",
+    )
+    state_path = tmp_path / "entry_state.json"
+    save_entry_state(
+        state_path,
+        EntrySessionState(
+            job_id="job-123",
+            template_sha256="template-sha",
+            workbook_path=tmp_path / "output.xlsx",
+            ocr_results_path=tmp_path / "ocr_results.json",
+            current_sheet_index=1,
+            sheet_order=["Data Input", "Expenses", "Retirement Accounts"],
+            pending_question=question,
+            sheet_summaries=[
+                SheetEntrySummary(
+                    sheet_name="Data Input",
+                    status="completed",
+                    mapped_count=2,
+                    message="Committed household names into the workbook.",
+                ),
+                SheetEntrySummary(
+                    sheet_name="Expenses",
+                    status="needs_input",
+                    message=question.prompt,
+                ),
+            ],
+        ),
+    )
+    fake_st.session_state["result"] = ImportArtifacts(
+        success=False,
+        job_id="job-123",
+        job_dir=tmp_path,
+        entry_state_path=state_path,
+        pending_question=question,
+    )
+    fake_st.session_state[app.QUESTION_ACTIVE_RESUME_STATE_KEY] = "job-123"
+
+    monkeypatch.setattr(app.time, "time", lambda: 121.0)
+    app.render_workbook_stage()
+
+    markup = fake_st.html_calls[-1]
+    assert "Needs your input" not in markup
+    assert question.prompt not in markup
+    assert "Waiting for your answer before workbook entry can continue." not in markup
+    assert "This section is being reviewed. Saved entries will appear here as soon as they are ready." in markup
+
+
+def test_render_masthead_prefers_raw_html_renderer_when_available(monkeypatch) -> None:
+    fake_st = _HtmlStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["run_started"] = True
+    fake_st.session_state["is_running"] = True
+    fake_st.session_state["active_stage"] = Stage.DATA_ENTRY.value
+    fake_st.session_state["last_status"] = {
+        "index": 2,
+        "stage": "Workbook entry",
+        "message": "LangGraph is working on Data Input.",
+        "severity": Severity.INFO,
+    }
+
+    settings_clicked = app.render_masthead()
+
+    assert settings_clicked is False
+    assert fake_st.html_calls
+    assert "HollyPlanner" in fake_st.html_calls[-1]
+    assert 'class="taskbar-shell"' in fake_st.html_calls[-1]
+    assert "Turn planner PDFs into locked workbooks" in fake_st.html_calls[-1]
+    assert "Stage 2 of 2" in fake_st.html_calls[-1]
+    assert "LangGraph is working on Data Input." in fake_st.html_calls[-1]
+    assert "In progress" in fake_st.html_calls[-1]
+
+
+def test_render_masthead_falls_back_to_markdown_without_html_renderer(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["run_started"] = True
+    fake_st.session_state["is_running"] = True
+    fake_st.session_state["active_stage"] = Stage.DATA_ENTRY.value
+    fake_st.session_state["last_status"] = {
+        "index": 2,
+        "stage": "Workbook entry",
+        "message": "LangGraph is working on Data Input.",
+        "severity": Severity.INFO,
+    }
+
+    settings_clicked = app.render_masthead()
+
+    assert settings_clicked is False
+    assert fake_st.markdown_calls
+    assert "HollyPlanner" in fake_st.markdown_calls[0]
+    assert 'class="taskbar-shell"' in fake_st.markdown_calls[0]
+    assert "Turn planner PDFs into locked workbooks" in fake_st.markdown_calls[0]
+    assert "Stage 2 of 2" in fake_st.markdown_calls[0]
+    assert "LangGraph is working on Data Input." in fake_st.markdown_calls[0]
+
+
+def test_render_masthead_compacts_rate_limit_status_into_taskbar(monkeypatch) -> None:
+    fake_st = _HtmlStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["run_started"] = True
+    fake_st.session_state["is_running"] = True
+    fake_st.session_state["active_stage"] = Stage.DATA_ENTRY.value
+    fake_st.session_state["workbook_retry"] = {
+        "sheet_name": "Data Input",
+        "retry_until_ms": 135000,
+        "attempt_number": 2,
+        "max_attempts": 7,
+        "retry_reason": "rate_limit",
+    }
+    fake_st.session_state["last_status"] = {
+        "index": 2,
+        "stage": "Workbook entry",
+        "message": "OpenAI rate limit hit while filling Data Input. Resuming pass 2/7 in 10.0s.",
+        "severity": Severity.WARNING,
+    }
+
+    app.render_masthead()
+
+    markup = fake_st.html_calls[-1]
+    assert 'class="taskbar-status throttle"' in markup
+    assert "Cooldown" in markup
+    assert "Pass 2/7" in markup
     assert 'data-countdown-target-ms="135000"' in markup
 
 
@@ -642,11 +1452,33 @@ def test_render_entry_question_supports_figure_it_out(monkeypatch) -> None:
         )
     )
 
+    assert (answer, source, submitted) == (None, None, False)
+    assert fake_st.dialog_calls[-1]["title"] == app.QUESTION_DIALOG_TITLE
+    assert fake_st.rerun_called is True
+    assert any("Planner decision required" in call for call in fake_st.markdown_calls)
+    assert not any("Affected targets" in call for call in fake_st.markdown_calls)
+
+    answer, source, submitted = app.render_entry_question(
+        SimpleNamespace(
+            job_id="job-1",
+            entry_state_path=None,
+            pending_question=AgentQuestion(
+                id="data-input-name",
+                sheet_name="Data Input",
+                prompt="Which first name should populate client 1?",
+                rationale="The OCR shows two possible names for client 1.",
+                affected_targets=["profile.client_1.first_name"],
+                options=[
+                    QuestionOption(label="Taylor", value="Taylor", description="Matches the recommended planner value."),
+                    QuestionOption(label="Tyler", value="Tyler", description="Appears in a secondary note."),
+                ],
+            ),
+        )
+    )
+
     assert submitted is True
     assert answer == ""
     assert source == "agent"
-    assert any("Question for you" in call for call in fake_st.markdown_calls)
-    assert any("Figure it out" in call for call in fake_st.markdown_calls)
 
 
 def test_render_entry_question_prefers_custom_answer(monkeypatch) -> None:
@@ -658,6 +1490,25 @@ def test_render_entry_question_prefers_custom_answer(monkeypatch) -> None:
     }
     monkeypatch.setattr(app, "st", fake_st)
     monkeypatch.setattr(app, "render_workbook_stage", lambda: None)
+
+    answer, source, submitted = app.render_entry_question(
+        SimpleNamespace(
+            job_id="job-2",
+            entry_state_path=None,
+            pending_question=AgentQuestion(
+                id="data-input-name",
+                sheet_name="Data Input",
+                prompt="Which first name should populate client 1?",
+                rationale="The OCR shows two possible names for client 1.",
+                affected_targets=["profile.client_1.first_name"],
+                options=[QuestionOption(label="Taylor", value="Taylor")],
+            ),
+        )
+    )
+
+    assert (answer, source, submitted) == (None, None, False)
+    assert fake_st.dialog_calls[-1]["title"] == app.QUESTION_DIALOG_TITLE
+    assert fake_st.rerun_called is True
 
     answer, source, submitted = app.render_entry_question(
         SimpleNamespace(
@@ -900,70 +1751,166 @@ def test_main_skips_ui_rerender_on_heartbeat(monkeypatch) -> None:
     app.main()
 
     assert observed == {
-        "status_calls": 5,
-        "progress_calls": 5,
+        "status_calls": 0,
+        "progress_calls": 0,
         "log_calls": 5,
         "work_calls": 5,
     }
 
 
-def test_main_can_start_from_cache(monkeypatch, tmp_path: Path) -> None:
-    observed: dict[str, object] = {}
+def test_consume_runner_events_rerenders_for_live_summary_heartbeat(monkeypatch) -> None:
     fake_st = _FakeStreamlit()
-    base_settings = replace(Settings.from_env(), debug_cache_path=tmp_path / "debug_cache.txt")
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["is_running"] = True
+    fake_st.session_state["active_stage"] = Stage.DATA_ENTRY.value
+    fake_st.session_state["agent_trace"] = {
+        "status": "running",
+        "current_sheet": "Data Input",
+        "message": "Reviewing OCR evidence, workbook context, and prior answers before proposing writes.",
+        "token_count": 0,
+        "started_at_ms": 120000,
+        "retry_until_ms": None,
+        "live_summary": None,
+        "live_summary_updated_at_ms": None,
+        "last_rendered_summary": None,
+        "recent_events": [],
+    }
+
+    observed = {"chrome": 0, "logs": 0, "work": 0}
+
+    monkeypatch.setattr(app, "render_shell_chrome", lambda placeholder: observed.__setitem__("chrome", observed["chrome"] + 1))
+    monkeypatch.setattr(app, "render_logs", lambda placeholder: observed.__setitem__("logs", observed["logs"] + 1))
+    monkeypatch.setattr(app, "render_work_area", lambda placeholder, settings: observed.__setitem__("work", observed["work"] + 1))
+
+    app.consume_runner_events(
+        events=[
+            RunEvent(
+                stage=Stage.DATA_ENTRY,
+                message="Workbook entry in progress.",
+                sheet_name="Data Input",
+                progress_message="Reviewing household profile evidence.",
+                stage_completed=0,
+                stage_total=7,
+                phase="heartbeat",
+            )
+        ],
+        settings=Settings.from_env(),
+        chrome_placeholder=object(),
+        log_placeholder=object(),
+        work_placeholder=object(),
+    )
+
+    assert observed == {"chrome": 2, "logs": 2, "work": 2}
+    assert fake_st.session_state["agent_trace"]["live_summary"] == "Reviewing household profile evidence."
+def test_main_queues_question_resume_before_running_job(monkeypatch, tmp_path: Path) -> None:
+    observed: dict[str, object] = {"resume_calls": 0}
+    fake_st = _FakeStreamlit()
+    base_settings = Settings.from_env()
+    fake_st.session_state["current_job_id"] = "job-42"
+    pending_question = AgentQuestion(
+        id="expenses-monthly-totals",
+        sheet_name="Expenses",
+        prompt="Please provide the monthly totals by expense line item.",
+        rationale="The transactions tab still needs category cleanup.",
+    )
+    fake_st.session_state["result"] = ImportArtifacts(
+        success=False,
+        job_id="job-42",
+        job_dir=tmp_path,
+        pending_question=pending_question,
+    )
+    fake_st.session_state["agent_trace"] = {
+        "status": "needs_input",
+        "current_sheet": "Expenses",
+        "message": pending_question.prompt,
+        "token_count": 0,
+        "started_at_ms": None,
+        "retry_until_ms": None,
+        "recent_events": [],
+    }
 
     class _FakeJobRunner:
         def __init__(self, settings) -> None:
             observed["runner_settings"] = settings
 
-        def load_phase_one_cache(self, path):
-            observed["load_cache_path"] = path
-            return SimpleNamespace(
-                source_filename="cached.pdf",
-                ocr_results=[SimpleNamespace(page_number=1), SimpleNamespace(page_number=2)],
-            )
-
-        def start_job_from_cache(self, path, *, cache=None):
-            observed["start_cache_path"] = path
-            observed["start_cache_filename"] = None if cache is None else cache.source_filename
-            yield RunEvent(
-                stage=Stage.DATA_ENTRY,
-                message="Beginning workbook entry.",
-                stage_completed=0,
-                stage_total=1,
-            )
+        def resume_job(self, job_id, answer, *, source):
+            observed["resume_calls"] = int(observed["resume_calls"]) + 1
+            observed["resume_args"] = (job_id, answer, source)
+            return []
 
     monkeypatch.setattr(app, "st", fake_st)
     monkeypatch.setattr(app, "inject_styles", lambda: None)
     monkeypatch.setattr(app, "mount_live_countdown_bridge", lambda: None)
     monkeypatch.setattr(app.Settings, "from_env", classmethod(lambda cls: base_settings))
     monkeypatch.setattr(app, "apply_runtime_settings", lambda settings: settings)
-    monkeypatch.setattr(app, "render_masthead", lambda: False)
-    monkeypatch.setattr(app, "render_status", lambda placeholder: None)
-    monkeypatch.setattr(app, "render_stage_progress", lambda: None)
+    monkeypatch.setattr(app, "render_shell_chrome", lambda placeholder: False)
     monkeypatch.setattr(app, "render_logs", lambda placeholder: None)
     monkeypatch.setattr(app, "JobRunner", _FakeJobRunner)
+    monkeypatch.setattr(app, "render_work_area", lambda work_placeholder, settings: (None, None, ("", "agent")))
 
-    def fake_render_work_area(work_placeholder, settings):
-        observed["work_calls"] = int(observed.get("work_calls", 0)) + 1
-        if observed["work_calls"] == 1:
-            return None, "cache", None
-        return None, None, None
+    app.main()
 
-    monkeypatch.setattr(app, "render_work_area", fake_render_work_area)
+    assert fake_st.rerun_called is True
+    assert observed["resume_calls"] == 0
+    assert fake_st.session_state[app.QUESTION_PENDING_RESUME_STATE_KEY] == {
+        "job_id": "job-42",
+        "answer": "",
+        "source": "agent",
+    }
+    assert fake_st.session_state[app.QUESTION_ACTIVE_RESUME_STATE_KEY] == "job-42"
+    assert fake_st.session_state["is_running"] is True
+    assert fake_st.session_state["active_stage"] == Stage.DATA_ENTRY.value
+    assert fake_st.session_state["last_status"]["message"] == "Resuming workbook entry."
+    assert fake_st.session_state["result"].pending_question is None
+    assert fake_st.session_state["agent_trace"]["status"] == "running"
+    assert fake_st.session_state["agent_trace"]["current_sheet"] == "Expenses"
+
+
+def test_main_resumes_question_after_follow_up_rerun(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+    fake_st = _FakeStreamlit()
+    base_settings = Settings.from_env()
+    fake_st.session_state["is_running"] = True
+    fake_st.session_state[app.QUESTION_PENDING_RESUME_STATE_KEY] = {
+        "job_id": "job-42",
+        "answer": "",
+        "source": "agent",
+    }
+
+    class _FakeJobRunner:
+        def __init__(self, settings) -> None:
+            observed["runner_settings"] = settings
+
+        def resume_job(self, job_id, answer, *, source):
+            observed["resume_args"] = (job_id, answer, source)
+            return []
+
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.setattr(app, "inject_styles", lambda: None)
+    monkeypatch.setattr(app, "mount_live_countdown_bridge", lambda: None)
+    monkeypatch.setattr(app.Settings, "from_env", classmethod(lambda cls: base_settings))
+    monkeypatch.setattr(app, "apply_runtime_settings", lambda settings: settings)
+    monkeypatch.setattr(app, "render_shell_chrome", lambda placeholder: False)
+    monkeypatch.setattr(app, "render_logs", lambda placeholder: None)
+    monkeypatch.setattr(app, "JobRunner", _FakeJobRunner)
+    monkeypatch.setattr(app, "render_work_area", lambda work_placeholder, settings: (None, None, None))
     monkeypatch.setattr(
         app,
-        "reset_cached_run_state",
-        lambda pipe_total, source_filename, page_total: observed.setdefault(
-            "reset_cached_run_state",
-            (pipe_total, source_filename, page_total),
+        "consume_runner_events",
+        lambda **kwargs: observed.setdefault(
+            "consume_args",
+            {
+                "events": kwargs["events"],
+                "settings": kwargs["settings"],
+            },
         ),
     )
 
     app.main()
 
     assert observed["runner_settings"] is base_settings
-    assert observed["load_cache_path"] == base_settings.debug_cache_path
-    assert observed["start_cache_path"] == base_settings.debug_cache_path
-    assert observed["start_cache_filename"] == "cached.pdf"
-    assert observed["reset_cached_run_state"] == (base_settings.ocr_parallel_workers, "cached.pdf", 2)
+    assert observed["resume_args"] == ("job-42", "", "agent")
+    assert observed["consume_args"]["events"] == []
+    assert observed["consume_args"]["settings"] is base_settings
+    assert fake_st.session_state.get(app.QUESTION_PENDING_RESUME_STATE_KEY) is None
