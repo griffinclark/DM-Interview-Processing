@@ -9,10 +9,13 @@ from collections.abc import Callable
 from typing import Any, Protocol, TypeVar
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.tools import BaseTool
 from langchain_openai import ChatOpenAI
+from openai import OpenAI
 from pydantic import BaseModel
 
+from planlock import APP_NAME, APP_TRACE_SLUG
 from planlock.config import LLM_PROVIDER_OPENAI, Settings
 from planlock.models import PageMappingResult, PageOcrResult
 from planlock.pdf_renderer import RenderedPage
@@ -21,11 +24,13 @@ from planlock.template_schema import schema_reference_for_prompt
 
 T = TypeVar("T")
 RetryNotifier = Callable[[str, int, int, float, Exception], None]
+UsageNotifier = Callable[[str, dict[str, int]], None]
+ProgressNotifier = Callable[[str, str], None]
 THROTTLE_RESET_HEADER_NAMES = (
     "x-ratelimit-reset-requests",
     "x-ratelimit-reset-tokens",
 )
-PAGE_PROCESS_TIMEOUT_SCHEDULE_SECONDS = (60.0, 90.0, 120.0)
+PAGE_PROCESS_TIMEOUT_SCHEDULE_SECONDS = (120.0, 180.0, 240.0)
 NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 422}
 COMPOSITE_DURATION_PATTERN = re.compile(r"(\d+(?:\.\d+)?)(ms|s|m|h|d)")
 SECONDS_PER_DURATION_UNIT = {
@@ -39,16 +44,22 @@ SECONDS_PER_DURATION_UNIT = {
 
 OCR_SYSTEM_PROMPT = """
 You are an OCR and layout-aware extraction engine for planner-facing financial plan PDFs.
-Your output is used downstream to populate a locked Excel workbook for financial planners, so extract only page-supported facts that can be mapped or reviewed later.
+Your output is persisted as OCR JSON and later used in exactly two ways:
+1. map direct evidence into a locked Excel workbook for financial planners
+2. re-review saved OCR evidence when a planner-facing ambiguity needs to be resolved
+Extract every page-supported token needed for those downstream tasks, but do not save content that cannot support a workbook write, recommendation review, or ambiguity resolution later.
 Read the supplied page image and native PDF text together.
 
 Rules:
 - Extract only what is directly visible on the current page.
-- Focus on planner-relevant content such as household names, dates, balances, income, expenses, savings targets, debts, account details, holdings, recommendations, assumptions, action items, and any current vs. proposed or target values.
+- Keep planner-relevant content such as household names, relationships, dates, balances, income, expenses, savings targets, debts, account details, holdings, recommendations, assumptions, action items, and any current vs. proposed or target values.
+- Omit decorative or non-operative content such as repeated headers or footers, page numbers, branding, generic contact blocks, navigation copy, marketing filler, and boilerplate legal or compliance disclosures unless that text changes a financial fact, recommendation, assumption, or account constraint.
+- When in doubt, keep the token if it could help defend a workbook write or resolve a later planner question.
 - Preserve qualifiers such as current, suggested, target, required, annual, monthly, or one-time.
 - Extract tables as tables when row and column structure is visible.
 - Pull usable data out of charts and graphs, including titles, legends, labels, axes, time periods, categories, and plotted values or comparisons. Represent that information in figures and tables whenever possible.
 - Capture recommendations and TODO items separately from numeric figures.
+- Use raw_text and source_snippets as compact evidence records, not archival page dumps. Include enough surrounding text to justify extracted facts later, but do not copy irrelevant prose.
 - If native text and the image disagree, trust the image.
 - Do not infer hidden rows, spreadsheet values, or unstated household details.
 - Return structured output only.
@@ -294,6 +305,186 @@ def describe_retry_error(exc: Exception | None) -> str:
     return f"{timeout_copy}: {original}"
 
 
+def token_usage_from_message(message: Any) -> dict[str, int] | None:
+    usage_metadata = getattr(message, "usage_metadata", None)
+    if isinstance(usage_metadata, dict):
+        input_tokens = int(usage_metadata.get("input_tokens") or 0)
+        output_tokens = int(usage_metadata.get("output_tokens") or 0)
+        total_tokens = int(usage_metadata.get("total_tokens") or (input_tokens + output_tokens))
+        return {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        }
+
+    response_metadata = getattr(message, "response_metadata", None)
+    if not isinstance(response_metadata, dict):
+        return None
+
+    raw_usage = response_metadata.get("token_usage") or response_metadata.get("usage")
+    if not isinstance(raw_usage, dict):
+        return None
+
+    input_tokens = int(raw_usage.get("prompt_tokens") or raw_usage.get("input_tokens") or 0)
+    output_tokens = int(raw_usage.get("completion_tokens") or raw_usage.get("output_tokens") or 0)
+    total_tokens = int(raw_usage.get("total_tokens") or (input_tokens + output_tokens))
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def token_usage_from_response(response: Any) -> dict[str, int] | None:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+
+    input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+    output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    total_tokens = int(getattr(usage, "total_tokens", 0) or (input_tokens + output_tokens))
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _is_sentence_boundary(text: str) -> bool:
+    stripped = text.rstrip()
+    if not stripped:
+        return False
+    return text.endswith("\n") or stripped.endswith((".", "!", "?"))
+
+
+def _response_input_role(message: Any) -> str:
+    if isinstance(message, SystemMessage):
+        return "system"
+    if isinstance(message, HumanMessage):
+        return "user"
+
+    message_type = str(getattr(message, "type", "")).lower()
+    if message_type in {"system", "developer"}:
+        return message_type
+    if message_type in {"ai", "assistant"}:
+        return "assistant"
+    return "user"
+
+
+def _response_input_content(content: Any) -> Any:
+    if isinstance(content, str):
+        return content
+
+    if not isinstance(content, list):
+        raise TypeError("Unsupported message content for OpenAI Responses streaming.")
+
+    response_content: list[dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            raise TypeError("Unsupported message content item for OpenAI Responses streaming.")
+
+        item_type = str(item.get("type") or "").strip()
+        if item_type == "text":
+            response_content.append(
+                {
+                    "type": "input_text",
+                    "text": str(item.get("text") or ""),
+                }
+            )
+            continue
+        if item_type == "image_url":
+            image_url = item.get("image_url") or {}
+            if not isinstance(image_url, dict):
+                raise TypeError("OpenAI Responses streaming expected image_url payload to be a dict.")
+            response_content.append(
+                {
+                    "type": "input_image",
+                    "image_url": str(image_url.get("url") or ""),
+                    "detail": str(image_url.get("detail") or "auto"),
+                }
+            )
+            continue
+        raise TypeError(f"Unsupported content type for OpenAI Responses streaming: {item_type or 'unknown'}")
+
+    return response_content
+
+
+def response_input_from_messages(messages: list[Any]) -> list[dict[str, Any]]:
+    response_messages: list[dict[str, Any]] = []
+    for message in messages:
+        response_messages.append(
+            {
+                "role": _response_input_role(message),
+                "content": _response_input_content(getattr(message, "content", message)),
+            }
+        )
+    return response_messages
+
+
+class ReasoningSummaryCoalescer:
+    def __init__(
+        self,
+        *,
+        operation_name: str,
+        notifier: ProgressNotifier,
+        min_emit_interval_seconds: float = 0.25,
+    ) -> None:
+        self._operation_name = operation_name
+        self._notifier = notifier
+        self._min_emit_interval_seconds = min_emit_interval_seconds
+        self._summary_parts: dict[int, str] = {}
+        self._last_emitted_text = ""
+        self._last_emitted_at = 0.0
+
+    def consume(self, event: Any) -> None:
+        event_type = str(getattr(event, "type", ""))
+        if event_type == "response.reasoning_summary_part.added":
+            summary_index = int(getattr(event, "summary_index", 0))
+            part = getattr(event, "part", None)
+            initial_text = str(getattr(part, "text", "") or "")
+            if initial_text:
+                self._summary_parts[summary_index] = initial_text
+                self._emit_if_ready()
+            return
+
+        if event_type == "response.reasoning_summary_text.delta":
+            summary_index = int(getattr(event, "summary_index", 0))
+            delta = str(getattr(event, "delta", "") or "")
+            if delta:
+                self._summary_parts[summary_index] = self._summary_parts.get(summary_index, "") + delta
+                self._emit_if_ready()
+            return
+
+        if event_type == "response.reasoning_summary_text.done":
+            summary_index = int(getattr(event, "summary_index", 0))
+            self._summary_parts[summary_index] = str(getattr(event, "text", "") or "")
+            self._emit_if_ready(force=True)
+
+    def flush(self) -> None:
+        self._emit_if_ready(force=True)
+
+    def _visible_text(self) -> str:
+        visible_parts = [
+            text.strip()
+            for _, text in sorted(self._summary_parts.items())
+            if text and text.strip()
+        ]
+        return "\n\n".join(visible_parts)
+
+    def _emit_if_ready(self, *, force: bool = False) -> None:
+        visible_text = self._visible_text()
+        if not visible_text or visible_text == self._last_emitted_text:
+            return
+
+        now = time.monotonic()
+        if not force and (now - self._last_emitted_at) < self._min_emit_interval_seconds and not _is_sentence_boundary(visible_text):
+            return
+
+        self._notifier(self._operation_name, visible_text)
+        self._last_emitted_text = visible_text
+        self._last_emitted_at = now
+
+
 def invoke_with_retries(
     settings: Settings,
     operation_name: str,
@@ -350,22 +541,26 @@ class StructuredOutputClient:
         self._settings = settings
         self._provider = settings.normalized_llm_provider()
         self._model = model
+        self._openai_client: OpenAI | None = None
         self._tags = [
-            "planlock",
+            APP_TRACE_SLUG,
             f"provider:{self._provider}",
             f"model:{self._model}",
         ]
         self._metadata = {
-            "planlock_provider": self._provider,
-            "planlock_model": self._model,
+            f"{APP_TRACE_SLUG}_provider": self._provider,
+            f"{APP_TRACE_SLUG}_model": self._model,
         }
 
         if self._provider == LLM_PROVIDER_OPENAI:
             if not settings.openai_api_key:
-                raise ValueError("OPENAI_API_KEY is required to run PlanLock with provider 'openai'.")
+                raise ValueError(f"OPENAI_API_KEY is required to run {APP_NAME} with provider 'openai'.")
+            self._openai_client = OpenAI(api_key=settings.openai_api_key)
         else:
             if not settings.anthropic_api_key:
-                raise ValueError("ANTHROPIC_API_KEY is required to run PlanLock with provider 'anthropic'.")
+                raise ValueError(
+                    f"ANTHROPIC_API_KEY is required to run {APP_NAME} with provider 'anthropic'."
+                )
 
     def _build_llm(self, *, timeout_seconds: float):
         if self._provider == LLM_PROVIDER_OPENAI:
@@ -391,16 +586,244 @@ class StructuredOutputClient:
         messages: list[Any],
         operation_name: str | None = None,
         timeout_seconds: float | None = None,
+        usage_notifier: UsageNotifier | None = None,
+        progress_notifier: ProgressNotifier | None = None,
+        tools: list[BaseTool] | None = None,
     ) -> BaseModel:
-        llm = self._build_llm(timeout_seconds=timeout_seconds or self._settings.llm_timeout_seconds)
-        runnable = llm.with_structured_output(schema).with_config(
+        resolved_operation_name = operation_name or f"{APP_NAME} {schema.__name__}"
+        resolved_timeout_seconds = timeout_seconds or self._settings.llm_timeout_seconds
+        if tools:
+            return self._invoke_with_tools(
+                schema=schema,
+                messages=messages,
+                operation_name=resolved_operation_name,
+                timeout_seconds=resolved_timeout_seconds,
+                usage_notifier=usage_notifier,
+                tools=tools,
+            )
+        if self._provider == LLM_PROVIDER_OPENAI:
+            if progress_notifier is not None:
+                return self._invoke_openai_responses_stream(
+                    schema=schema,
+                    messages=messages,
+                    operation_name=resolved_operation_name,
+                    timeout_seconds=resolved_timeout_seconds,
+                    usage_notifier=usage_notifier,
+                    progress_notifier=progress_notifier,
+                )
+            return self._invoke_openai_responses_parse(
+                schema=schema,
+                messages=messages,
+                operation_name=resolved_operation_name,
+                timeout_seconds=resolved_timeout_seconds,
+                usage_notifier=usage_notifier,
+            )
+
+        return self._invoke_langchain_structured_output(
+            schema=schema,
+            messages=messages,
+            operation_name=resolved_operation_name,
+            timeout_seconds=resolved_timeout_seconds,
+            usage_notifier=usage_notifier,
+        )
+
+    def _invoke_with_tools(
+        self,
+        *,
+        schema: type[BaseModel],
+        messages: list[Any],
+        operation_name: str,
+        timeout_seconds: float,
+        usage_notifier: UsageNotifier | None,
+        tools: list[BaseTool],
+        max_tool_round_trips: int = 6,
+    ) -> BaseModel:
+        llm = self._build_llm(timeout_seconds=timeout_seconds)
+        tool_runnable = llm.bind_tools(tools).with_config(
             {
-                "run_name": operation_name or f"PlanLock {schema.__name__}",
+                "run_name": f"{operation_name} (tools)",
                 "tags": self._tags,
                 "metadata": self._metadata,
             }
         )
-        return runnable.invoke(messages)
+        tool_map = {tool.name: tool for tool in tools}
+        conversation = list(messages)
+
+        for _ in range(max_tool_round_trips):
+            tool_response = tool_runnable.invoke(conversation)
+            if usage_notifier is not None:
+                token_usage = token_usage_from_message(tool_response)
+                if token_usage is not None:
+                    usage_notifier(operation_name, token_usage)
+
+            if not isinstance(tool_response, AIMessage):
+                raise TypeError("Tool-enabled runnable returned an unexpected payload.")
+
+            conversation.append(tool_response)
+            if not tool_response.tool_calls:
+                return self._invoke_langchain_structured_output(
+                    schema=schema,
+                    messages=[
+                        *conversation,
+                        HumanMessage(
+                            content=(
+                                f"Using the tool results above, return the final {schema.__name__} "
+                                "structured output only."
+                            )
+                        ),
+                    ],
+                    operation_name=operation_name,
+                    timeout_seconds=timeout_seconds,
+                    usage_notifier=usage_notifier,
+                )
+
+            for tool_call in tool_response.tool_calls:
+                tool_name = str(tool_call.get("name", "")).strip()
+                tool = tool_map.get(tool_name)
+                if tool is None:
+                    payload: str | dict[str, object] = {
+                        "status": "error",
+                        "error": f"Unknown tool '{tool_name}'.",
+                    }
+                else:
+                    try:
+                        payload = tool.invoke(tool_call.get("args", {}))
+                    except Exception as exc:  # noqa: BLE001
+                        payload = {
+                            "status": "error",
+                            "error": str(exc),
+                        }
+                conversation.append(
+                    ToolMessage(
+                        content=self._serialize_tool_payload(payload),
+                        tool_call_id=str(tool_call.get("id", tool_name or "tool-call")),
+                        name=tool_name,
+                    )
+                )
+
+        raise RuntimeError(
+            f"{operation_name} exceeded the maximum number of tool round-trips ({max_tool_round_trips})."
+        )
+
+    def _invoke_langchain_structured_output(
+        self,
+        *,
+        schema: type[BaseModel],
+        messages: list[Any],
+        operation_name: str,
+        timeout_seconds: float,
+        usage_notifier: UsageNotifier | None,
+    ) -> BaseModel:
+        llm = self._build_llm(timeout_seconds=timeout_seconds)
+        runnable = llm.with_structured_output(schema, include_raw=True).with_config(
+            {
+                "run_name": operation_name,
+                "tags": self._tags,
+                "metadata": self._metadata,
+            }
+        )
+        response = runnable.invoke(messages)
+        if not isinstance(response, dict):
+            raise TypeError("Structured output runnable returned an unexpected payload.")
+
+        parsing_error = response.get("parsing_error")
+        if parsing_error is not None:
+            raise parsing_error
+
+        raw_message = response.get("raw")
+        if usage_notifier is not None and raw_message is not None:
+            token_usage = token_usage_from_message(raw_message)
+            if token_usage is not None:
+                usage_notifier(operation_name, token_usage)
+
+        parsed = response.get("parsed")
+        if isinstance(parsed, schema):
+            return parsed
+        if parsed is None:
+            raise ValueError("Structured output parsing returned no result.")
+        return schema.model_validate(parsed)
+
+    @staticmethod
+    def _serialize_tool_payload(payload: str | dict[str, object] | object) -> str:
+        if isinstance(payload, str):
+            return payload
+        return json.dumps(payload, ensure_ascii=True, default=str)
+
+    def _invoke_openai_responses_parse(
+        self,
+        *,
+        schema: type[BaseModel],
+        messages: list[Any],
+        operation_name: str,
+        timeout_seconds: float,
+        usage_notifier: UsageNotifier | None,
+    ) -> BaseModel:
+        if self._openai_client is None:
+            raise RuntimeError("OpenAI client is unavailable for Responses parsing.")
+
+        response = self._openai_client.responses.parse(
+            model=self._model,
+            input=response_input_from_messages(messages),
+            text_format=schema,
+            temperature=0,
+            metadata=self._metadata,
+            timeout=timeout_seconds,
+        )
+
+        if usage_notifier is not None:
+            token_usage = token_usage_from_response(response)
+            if token_usage is not None:
+                usage_notifier(operation_name, token_usage)
+
+        parsed = response.output_parsed
+        if isinstance(parsed, schema):
+            return parsed
+        if parsed is None:
+            raise ValueError("Structured output parsing returned no result.")
+        return schema.model_validate(parsed)
+
+    def _invoke_openai_responses_stream(
+        self,
+        *,
+        schema: type[BaseModel],
+        messages: list[Any],
+        operation_name: str,
+        timeout_seconds: float,
+        usage_notifier: UsageNotifier | None,
+        progress_notifier: ProgressNotifier,
+    ) -> BaseModel:
+        if self._openai_client is None:
+            raise RuntimeError("OpenAI client is unavailable for Responses streaming.")
+
+        summary_coalescer = ReasoningSummaryCoalescer(
+            operation_name=operation_name,
+            notifier=progress_notifier,
+        )
+        with self._openai_client.responses.stream(
+            model=self._model,
+            input=response_input_from_messages(messages),
+            text_format=schema,
+            reasoning={"summary": "concise"},
+            temperature=0,
+            metadata=self._metadata,
+            timeout=timeout_seconds,
+        ) as stream:
+            for event in stream:
+                summary_coalescer.consume(event)
+            response = stream.get_final_response()
+
+        summary_coalescer.flush()
+        if usage_notifier is not None:
+            token_usage = token_usage_from_response(response)
+            if token_usage is not None:
+                usage_notifier(operation_name, token_usage)
+
+        parsed = response.output_parsed
+        if isinstance(parsed, schema):
+            return parsed
+        if parsed is None:
+            raise ValueError("Structured output parsing returned no result.")
+        return schema.model_validate(parsed)
 
 
 class ExtractionClient(Protocol):
@@ -466,7 +889,9 @@ class ProviderExtractionClient:
     ) -> PageOcrResult:
         prompt = (
             f"Page number: {page.page_number}\n"
-            "This OCR output will be used to populate a locked planner workbook, so prioritize structured financial facts, recommendations, tables, and chart or graph values.\n"
+            "This OCR JSON is saved to disk and later reused for workbook mapping and raw PDF ambiguity review.\n"
+            "Capture every token needed for those steps, but do not save decorative or boilerplate text that cannot affect a workbook write, recommendation review, or planner decision.\n"
+            "Prioritize structured financial facts, recommendations, tables, and chart or graph values.\n"
             "Use the native text as a hint, but trust the image for layout, tables, charts, and graphs.\n\n"
             f"Native PDF text:\n{page.native_text}"
         )

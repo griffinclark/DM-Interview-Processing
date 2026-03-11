@@ -50,7 +50,7 @@ class TrackingTemplateEntryAgent:
     def __init__(self) -> None:
         self.sheet_calls: list[str] = []
 
-    def advance(self, state, ocr_results, retry_notifier=None):
+    def advance(self, state, ocr_results, retry_notifier=None, usage_notifier=None, progress_notifier=None):
         sheet_name = state.sheet_order[state.current_sheet_index]
         self.sheet_calls.append(sheet_name)
         if sheet_name == "Data Input":
@@ -92,7 +92,7 @@ class TrackingTemplateEntryAgent:
 
 
 class QuestioningTemplateEntryAgent(TrackingTemplateEntryAgent):
-    def advance(self, state, ocr_results, retry_notifier=None):
+    def advance(self, state, ocr_results, retry_notifier=None, usage_notifier=None, progress_notifier=None):
         sheet_name = state.sheet_order[state.current_sheet_index]
         self.sheet_calls.append(sheet_name)
         if sheet_name == "Data Input" and not any(answer.sheet_name == "Data Input" for answer in state.user_answers):
@@ -148,7 +148,7 @@ class QuestioningTemplateEntryAgent(TrackingTemplateEntryAgent):
 
 
 class LowCoverageTemplateEntryAgent(TrackingTemplateEntryAgent):
-    def advance(self, state, ocr_results, retry_notifier=None):
+    def advance(self, state, ocr_results, retry_notifier=None, usage_notifier=None, progress_notifier=None):
         sheet_name = state.sheet_order[state.current_sheet_index]
         self.sheet_calls.append(sheet_name)
         if sheet_name == "Data Input":
@@ -165,7 +165,7 @@ class LowCoverageTemplateEntryAgent(TrackingTemplateEntryAgent):
 
 
 class RetryingTemplateEntryAgent(TrackingTemplateEntryAgent):
-    def advance(self, state, ocr_results, retry_notifier=None):
+    def advance(self, state, ocr_results, retry_notifier=None, usage_notifier=None, progress_notifier=None):
         if retry_notifier is not None:
             retry_notifier(
                 "Workbook entry for Data Input",
@@ -181,7 +181,7 @@ class RetryingTemplateEntryAgent(TrackingTemplateEntryAgent):
 
 
 class SilentRetryingTemplateEntryAgent(TrackingTemplateEntryAgent):
-    def advance(self, state, ocr_results, retry_notifier=None):
+    def advance(self, state, ocr_results, retry_notifier=None, usage_notifier=None, progress_notifier=None):
         if retry_notifier is not None:
             retry_notifier(
                 "Workbook entry for Data Input",
@@ -189,6 +189,34 @@ class SilentRetryingTemplateEntryAgent(TrackingTemplateEntryAgent):
                 7,
                 10.0,
                 SilentRateLimitError("HTTP 429"),
+            )
+        time.sleep(0.2)
+        return super().advance(state, ocr_results, retry_notifier=retry_notifier)
+
+
+class TokenReportingTemplateEntryAgent(TrackingTemplateEntryAgent):
+    def advance(self, state, ocr_results, retry_notifier=None, usage_notifier=None, progress_notifier=None):
+        if usage_notifier is not None:
+            usage_notifier(
+                "Workbook entry for Data Input",
+                {
+                    "input_tokens": 9,
+                    "output_tokens": 6,
+                    "total_tokens": 15,
+                },
+            )
+        time.sleep(0.2)
+        return super().advance(state, ocr_results, retry_notifier=retry_notifier)
+
+
+class ProgressReportingTemplateEntryAgent(TrackingTemplateEntryAgent):
+    def advance(self, state, ocr_results, retry_notifier=None, usage_notifier=None, progress_notifier=None):
+        if progress_notifier is not None:
+            progress_notifier("Workbook entry for Data Input", "Reviewing household profile evidence.")
+            progress_notifier("Workbook entry for Data Input", "Reviewing household profile evidence.")
+            progress_notifier(
+                "Workbook entry for Data Input",
+                "Matching workbook fields to the strongest OCR evidence.",
             )
         time.sleep(0.2)
         return super().advance(state, ocr_results, retry_notifier=retry_notifier)
@@ -239,7 +267,6 @@ def _settings(tmp_path: Path, **kwargs) -> Settings:
     settings = replace(
         Settings.from_env(),
         jobs_dir=tmp_path / "jobs",
-        debug_cache_path=tmp_path / "debug_cache.txt",
         **kwargs,
     )
     settings.ensure_runtime_dirs()
@@ -310,6 +337,44 @@ def test_job_runner_emits_heartbeat_events_while_ocr_is_waiting(tmp_path: Path) 
     assert any(event.phase == "heartbeat" for event in events)
 
 
+def test_job_runner_streams_agent_token_totals_on_workbook_heartbeats(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    runner = JobRunner(
+        settings,
+        extraction_client=FakeExtractionClient(),
+        entry_agent=TokenReportingTemplateEntryAgent(),
+    )
+
+    events = list(runner.run(_make_pdf_bytes(), "test.pdf"))
+    heartbeat_events = [
+        event
+        for event in events
+        if event.stage == Stage.DATA_ENTRY and event.phase == "heartbeat" and event.agent_total_tokens is not None
+    ]
+
+    assert heartbeat_events
+    assert heartbeat_events[0].agent_total_tokens == 15
+
+
+def test_job_runner_streams_reasoning_summaries_on_workbook_heartbeats(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    runner = JobRunner(
+        settings,
+        extraction_client=FakeExtractionClient(),
+        entry_agent=ProgressReportingTemplateEntryAgent(),
+    )
+
+    events = list(runner.run(_make_pdf_bytes(), "test.pdf"))
+    heartbeat_events = [
+        event
+        for event in events
+        if event.stage == Stage.DATA_ENTRY and event.phase == "heartbeat" and event.progress_message is not None
+    ]
+
+    assert heartbeat_events
+    assert heartbeat_events[0].progress_message == "Matching workbook fields to the strongest OCR evidence."
+
+
 def test_job_runner_persists_ocr_results_and_resumes_after_question(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     runner = JobRunner(
@@ -328,11 +393,6 @@ def test_job_runner_persists_ocr_results_and_resumes_after_question(tmp_path: Pa
     assert paused_event.artifacts.entry_state_path.exists()
     assert paused_event.artifacts.ocr_results_path is not None
     assert paused_event.artifacts.ocr_results_path.exists()
-    assert settings.debug_cache_path.exists()
-
-    cache = runner.load_phase_one_cache(settings.debug_cache_path)
-    assert cache.source_filename == "test.pdf"
-    assert len(cache.ocr_results) == 1
 
     resume_events = list(runner.resume_job(paused_event.artifacts.job_id, "Taylor"))
     assert resume_events[-1].artifacts is not None
@@ -359,24 +419,6 @@ def test_job_runner_can_delegate_question_back_to_agent(tmp_path: Path) -> None:
     assert resume_events[-1].artifacts.review_report is not None
     assert resume_events[-1].artifacts.review_report.user_answers[0].source == "agent"
     assert resume_events[-1].artifacts.review_report.success
-
-
-def test_job_runner_can_start_phase_two_from_debug_cache(tmp_path: Path) -> None:
-    settings = _settings(tmp_path)
-    runner = JobRunner(settings, extraction_client=FakeExtractionClient(), entry_agent=TrackingTemplateEntryAgent())
-
-    list(runner.start_job(_make_pdf_bytes(), "test.pdf"))
-    cached_events = list(runner.start_job_from_cache(settings.debug_cache_path))
-
-    assert settings.debug_cache_path.exists()
-    assert cached_events
-    assert cached_events[0].stage == Stage.DATA_ENTRY
-    assert all(event.stage != Stage.OCR for event in cached_events)
-    assert cached_events[-1].artifacts is not None
-    assert cached_events[-1].artifacts.review_report is not None
-    assert cached_events[-1].artifacts.review_report.success
-
-
 def test_job_runner_traverses_template_in_sheet_order(tmp_path: Path) -> None:
     settings = _settings(tmp_path)
     agent = TrackingTemplateEntryAgent()
@@ -393,6 +435,19 @@ def test_job_runner_traverses_template_in_sheet_order(tmp_path: Path) -> None:
         "Taxable Accounts",
         "Education Accounts",
     ]
+
+
+def test_job_runner_emits_sheet_start_events_for_workbook_entry(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    runner = JobRunner(settings, extraction_client=FakeExtractionClient(), entry_agent=TrackingTemplateEntryAgent())
+
+    events = list(runner.run(_make_pdf_bytes(), "test.pdf"))
+    start_events = [event for event in events if event.stage == Stage.DATA_ENTRY and event.phase == "start"]
+
+    assert start_events
+    assert start_events[0].sheet_name == "Data Input"
+    assert start_events[0].message == "LangGraph is working on Data Input."
+    assert "Reviewing OCR evidence" in str(start_events[0].detail_message)
 
 
 def test_job_runner_marks_low_coverage_runs_for_review(tmp_path: Path) -> None:
@@ -487,10 +542,10 @@ def test_timeout_retry_event_mentions_escalated_timeout() -> None:
             "attempt_number": 2,
             "max_attempts": 3,
             "retry_delay_seconds": 0.0,
-            "detail_message": "OCR page 1: request timed out after 60.0s",
+            "detail_message": "OCR page 1: request timed out after 120.0s",
             "retry_reason": "timeout",
-            "current_timeout_seconds": 60.0,
-            "next_timeout_seconds": 90.0,
+            "current_timeout_seconds": 120.0,
+            "next_timeout_seconds": 180.0,
         }
     )
 
@@ -499,7 +554,7 @@ def test_timeout_retry_event_mentions_escalated_timeout() -> None:
     assert len(events) == 1
     assert (
         events[0].message
-        == "Page 1/23 in lane 1 exceeded the 60s processing limit. Retrying immediately with 90s timeout (pass 2/3)."
+        == "Page 1/23 in lane 1 exceeded the 120s processing limit. Retrying immediately with 180s timeout (pass 2/3)."
     )
     assert events[0].retry_reason == "timeout"
 

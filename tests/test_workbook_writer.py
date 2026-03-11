@@ -75,3 +75,16 @@ def test_build_assignments_and_preserve_formula_driven_fields(tmp_path: Path) ->
     assert workbook["Taxable Accounts"]["B6"].value == "Brokerage"
     assert workbook["Taxable Accounts"]["K7"].value == '=IF(AND(I7<>"",J7<>""),I7*J7,"")'
     assert workbook["Taxable Accounts"]["M7"].value == '=IF(AND(I7<>"",J7<>"",L7<>""),I7*(J7-L7),"")'
+
+
+def test_copy_locked_template_preserves_prepopulated_transactions(tmp_path: Path) -> None:
+    settings = Settings.from_env()
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    workbook_path = copy_locked_template(settings, job_dir)
+
+    workbook = load_workbook(workbook_path)
+
+    assert workbook["Transactions Raw"]["A1"].value == "account"
+    assert workbook["Transactions Raw"]["A2"].value == "Amex Joint"
+    assert workbook["Transactions Raw"]["F2"].value == "Aftercare/Childcare/Tuition"

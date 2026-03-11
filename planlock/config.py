@@ -24,8 +24,8 @@ LOCKED_PROVIDER_MODELS = {
 }
 DEFAULT_MODEL_OCR = LOCKED_PROVIDER_MODELS[DEFAULT_LLM_PROVIDER]
 DEFAULT_MODEL_MAPPING = LOCKED_PROVIDER_MODELS[DEFAULT_LLM_PROVIDER]
-DEFAULT_OCR_PARALLEL_WORKERS = 3
-DEFAULT_LLM_TIMEOUT_SECONDS = 120.0
+DEFAULT_OCR_PARALLEL_WORKERS = 6
+DEFAULT_LLM_TIMEOUT_SECONDS = 240.0
 DEFAULT_LLM_MAX_RETRIES = 2
 DEFAULT_LLM_RETRY_BASE_SECONDS = 10.0
 DEFAULT_LLM_RETRY_MAX_SECONDS = 300.0
@@ -92,7 +92,6 @@ class Settings:
     log_level: str
     jobs_dir: Path
     sample_pdf_path: Path
-    debug_cache_path: Path
     workbook_output_name: str = "filled_financial_plan.xlsx"
     review_report_name: str = "review_report.json"
     ocr_results_name: str = "ocr_results.json"
@@ -125,7 +124,6 @@ class Settings:
             log_level=DEFAULT_LOG_LEVEL,
             jobs_dir=PROJECT_ROOT / "tmp" / "jobs",
             sample_pdf_path=DEFAULT_SAMPLE_PDF,
-            debug_cache_path=PROJECT_ROOT / "debug_cache.txt",
             min_supported_coverage=DEFAULT_MIN_SUPPORTED_COVERAGE,
             max_unresolved_supported_targets=DEFAULT_MAX_UNRESOLVED_SUPPORTED_TARGETS,
         )

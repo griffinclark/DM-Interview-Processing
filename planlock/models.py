@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from planlock import APP_NAME
+
 
 class Stage(str, Enum):
     OCR = "OCR"
@@ -65,7 +67,7 @@ class FieldCandidate(BaseModel):
 
 class ExpenseCandidate(BaseModel):
     category: str
-    label: str = "PlanLock Import"
+    label: str = f"{APP_NAME} Import"
     monthly_amount: float | None = None
     yearly_amount: float | None = None
     discretionary: bool | None = None
@@ -264,15 +266,12 @@ class ImportArtifacts(BaseModel):
     pending_question: AgentQuestion | None = None
 
 
-class PhaseOneCache(BaseModel):
-    source_filename: str
-    page_total: int = 0
-    ocr_results: list[PageOcrResult] = Field(default_factory=list)
-
-
 class RunEvent(BaseModel):
     stage: Stage
     message: str
+    sheet_name: str | None = None
+    agent_total_tokens: int | None = None
+    progress_message: str | None = None
     detail_message: str | None = None
     severity: Severity = Severity.INFO
     stage_completed: int = 0

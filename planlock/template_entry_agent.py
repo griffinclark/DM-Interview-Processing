@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+from datetime import date, datetime
 import json
 from pathlib import Path
-from typing import Protocol, TypedDict
+from typing import Literal, Protocol, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import BaseTool
 from langgraph.graph import END, StateGraph
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 
 from planlock.config import Settings
-from planlock.llm_pipeline import RetryNotifier, StructuredOutputClient, invoke_with_retries
+from planlock.llm_pipeline import (
+    ProgressNotifier,
+    RetryNotifier,
+    StructuredOutputClient,
+    UsageNotifier,
+    invoke_with_retries,
+)
 from planlock.models import (
     AgentAnswer,
     AgentQuestion,
@@ -28,6 +36,12 @@ from planlock.template_schema import (
     TEMPLATE_SHEET_ORDER,
     sheet_reference_for_prompt,
 )
+from planlock.transactions_query import (
+    TRANSACTIONS_SHEET_NAME,
+    build_query_transactions_tool,
+    has_transaction_data,
+    transactions_query_schema_reference,
+)
 
 SHEET_ENTRY_SYSTEM_PROMPT = """
 You fill one locked workbook sheet at a time using OCR data, workbook state, and prior user answers.
@@ -35,6 +49,7 @@ You fill one locked workbook sheet at a time using OCR data, workbook state, and
 Rules:
 - Only emit candidates for the active workbook sheet.
 - You may inspect the full OCR corpus for context, but only map values supported by the active sheet schema.
+- If a ledger query tool is available, use it before asking the user to manually inspect or total transaction rows.
 - Ask a user question only when a material ambiguity blocks a supported target on the active sheet.
 - If the user explicitly delegates a decision back to you, choose the most defensible supported value from the available evidence and do not ask the same question again unless the sheet still cannot proceed safely.
 - Emit literal values only for directly observed constants or user-provided answers.
@@ -63,6 +78,8 @@ class TemplateEntryAgent(Protocol):
         session_state: EntrySessionState,
         ocr_results: list[PageOcrResult],
         retry_notifier: RetryNotifier | None = None,
+        usage_notifier: UsageNotifier | None = None,
+        progress_notifier: ProgressNotifier | None = None,
     ) -> EntrySessionState:
         ...
 
@@ -71,6 +88,9 @@ class _GraphState(TypedDict):
     sheet_name: str
     prompt: str
     retry_notifier: RetryNotifier | None
+    usage_notifier: UsageNotifier | None
+    progress_notifier: ProgressNotifier | None
+    tools: list[BaseTool]
     result: SheetEntryResult | None
 
 
@@ -123,6 +143,106 @@ def read_sheet_context(
     else:
         lines.append("- No writable cells are populated yet.")
     return "\n".join(lines)
+
+
+def _stringify_workbook_value(value: object) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat(sep=" ")
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
+
+
+def read_preloaded_template_context(
+    workbook_path: Path,
+    *,
+    sample_row_limit: int = 5,
+    exclude_sheet_names: set[str] | None = None,
+) -> list[dict[str, object]]:
+    workbook = load_workbook(workbook_path, data_only=False)
+    summaries: list[dict[str, object]] = []
+    excluded = {TRANSACTIONS_SHEET_NAME, *(exclude_sheet_names or set())}
+
+    for sheet_name in workbook.sheetnames:
+        if sheet_name in excluded:
+            continue
+        if ALLOWED_WRITE_CELLS_BY_SHEET.get(sheet_name):
+            continue
+
+        sheet = workbook[sheet_name]
+        populated_rows: list[tuple[int, list[object]]] = []
+        for row_number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+            if any(value not in (None, "") for value in row):
+                populated_rows.append((row_number, list(row)))
+
+        if not populated_rows:
+            continue
+
+        header_row_number, header_values = populated_rows[0]
+        header_pairs: list[tuple[int, str]] = []
+        for index, value in enumerate(header_values):
+            if value in (None, ""):
+                continue
+            header = _stringify_workbook_value(value).strip()
+            if header:
+                header_pairs.append((index, header))
+        headers = [header for _, header in header_pairs]
+
+        sample_rows: list[dict[str, object]] = []
+        for row_number, row_values in populated_rows[1 : sample_row_limit + 1]:
+            record: dict[str, str] = {}
+            for index, header in header_pairs:
+                if index >= len(row_values):
+                    continue
+                value = row_values[index]
+                if value in (None, ""):
+                    continue
+                record[header] = _stringify_workbook_value(value)
+            if record:
+                sample_rows.append({"row_number": row_number, "values": record})
+
+        summaries.append(
+            {
+                "sheet_name": sheet_name,
+                "template_data_present": True,
+                "header_row_number": header_row_number,
+                "header_columns": headers,
+                "data_row_count": max(0, len(populated_rows) - 1),
+                "sample_rows": sample_rows,
+                "note": (
+                    "This sheet already contains starter data from the locked template before any "
+                    "agent writes. The sample rows below are illustrative; the full sheet data is "
+                    "already present in the workbook."
+                ),
+            }
+        )
+
+    return summaries
+
+
+def sheet_has_preloaded_template_data(workbook_path: Path, sheet_name: str) -> bool:
+    workbook = load_workbook(workbook_path, data_only=False)
+    sheet = workbook[sheet_name]
+    for row in sheet.iter_rows(values_only=True):
+        if any(value not in (None, "") for value in row):
+            return True
+    return False
+
+
+def sheet_has_populated_writable_cells(workbook_path: Path, sheet_name: str) -> bool:
+    allowed_cells = sorted(ALLOWED_WRITE_CELLS_BY_SHEET.get(sheet_name, set()))
+    if not allowed_cells:
+        return False
+    workbook = load_workbook(workbook_path, data_only=False)
+    sheet = workbook[sheet_name]
+    return any(sheet[cell_ref].value not in (None, "") for cell_ref in allowed_cells)
+
+
+def prioritize_data_input_sheet(sheet_order: list[str]) -> list[str]:
+    ordered = list(sheet_order)
+    if "Data Input" not in ordered or not ordered or ordered[0] == "Data Input":
+        return ordered
+    return ["Data Input", *[sheet_name for sheet_name in ordered if sheet_name != "Data Input"]]
 
 
 def touched_cells_for_assignments(assignments: list[CellAssignment], sheet_name: str) -> list[str]:
@@ -193,15 +313,26 @@ class LangGraphTemplateEntryAgent:
         schema,
         messages,
         retry_notifier: RetryNotifier | None = None,
+        usage_notifier: UsageNotifier | None = None,
+        progress_notifier: ProgressNotifier | None = None,
+        tools: list[BaseTool] | None = None,
     ):
+        invoke_kwargs = {
+            "schema": schema,
+            "messages": messages,
+            "operation_name": operation_name,
+            "tools": tools,
+        }
+        if usage_notifier is not None:
+            invoke_kwargs["usage_notifier"] = usage_notifier
+        if progress_notifier is not None:
+            invoke_kwargs["progress_notifier"] = progress_notifier
         return invoke_with_retries(
             self._settings,
             operation_name,
             lambda timeout_seconds: self._llm.invoke(
-                schema=schema,
-                messages=messages,
-                operation_name=operation_name,
                 timeout_seconds=timeout_seconds,
+                **invoke_kwargs,
             ),
             retry_notifier=retry_notifier,
         )
@@ -215,14 +346,103 @@ class LangGraphTemplateEntryAgent:
                 HumanMessage(content=state["prompt"]),
             ],
             retry_notifier=state.get("retry_notifier"),
+            usage_notifier=state.get("usage_notifier"),
+            progress_notifier=state.get("progress_notifier"),
+            tools=state.get("tools") or None,
         )
         result.sheet_name = state["sheet_name"]
         return {
             "sheet_name": state["sheet_name"],
             "prompt": state["prompt"],
             "retry_notifier": state.get("retry_notifier"),
+            "usage_notifier": state.get("usage_notifier"),
+            "progress_notifier": state.get("progress_notifier"),
+            "tools": state.get("tools", []),
             "result": result,
         }
+
+    @staticmethod
+    def _mapped_item_count(result: SheetEntryResult) -> int:
+        return (
+            len(result.mapped_fields)
+            + len(result.expenses)
+            + len(result.accounts)
+            + len(result.holdings)
+        )
+
+    @staticmethod
+    def _structured_ocr_context(ocr_results: list[PageOcrResult]) -> list[dict[str, object]]:
+        payload: list[dict[str, object]] = []
+        for result in ocr_results:
+            payload.append(
+                {
+                    "page_number": result.page_number,
+                    "summary": result.summary,
+                    "source_snippets": result.source_snippets[:6],
+                    "figures": [figure.model_dump(mode="json") for figure in result.figures],
+                    "tables": [
+                        {
+                            "title": table.title,
+                            "headers": table.headers,
+                            "rows": table.rows[:6],
+                        }
+                        for table in result.tables
+                    ],
+                    "recommendations": result.recommendations,
+                    "confidence": result.confidence,
+                }
+            )
+        return payload
+
+    @staticmethod
+    def _context_stage_instructions(context_stage: Literal["workbook_only", "ocr_results"]) -> str:
+        if context_stage == "workbook_only":
+            return (
+                "Context stage: workbook_only\n"
+                "Use the active sheet, preloaded template data, and populated Data Input workbook values first. "
+                "Structured OCR evidence is intentionally omitted in this pass to conserve tokens. "
+                "If workbook context is insufficient, leave targets unresolved or ask a question and the runner "
+                "will escalate to OCR."
+            )
+        return (
+            "Context stage: ocr_results\n"
+            "Workbook context stays primary, and structured OCR evidence is available in this pass. "
+            "Use OCR only where workbook context is insufficient. Raw OCR text is still withheld unless a later "
+            "raw-PDF fallback is needed."
+        )
+
+    def _data_input_context(
+        self,
+        *,
+        session_state: EntrySessionState,
+        sheet_name: str,
+    ) -> str | None:
+        if sheet_name == "Data Input":
+            return None
+        if not sheet_has_populated_writable_cells(session_state.workbook_path, "Data Input"):
+            return None
+        return read_sheet_context(
+            session_state.workbook_path,
+            "Data Input",
+            touched_cells=touched_cells_for_assignments(session_state.mapped_assignments, "Data Input"),
+        )
+
+    @staticmethod
+    def _transactions_tool_available(*, workbook_path: Path, sheet_name: str) -> bool:
+        return sheet_name == "Expenses" and has_transaction_data(workbook_path)
+
+    def _sheet_tools(
+        self,
+        *,
+        session_state: EntrySessionState,
+        sheet_name: str,
+    ) -> list[BaseTool]:
+        if not self._transactions_tool_available(
+            workbook_path=session_state.workbook_path,
+            sheet_name=sheet_name,
+        ):
+            return []
+        return [build_query_transactions_tool(session_state.workbook_path)]
 
     def _build_prompt(
         self,
@@ -230,6 +450,7 @@ class LangGraphTemplateEntryAgent:
         session_state: EntrySessionState,
         ocr_results: list[PageOcrResult],
         sheet_name: str,
+        context_stage: Literal["workbook_only", "ocr_results"],
     ) -> str:
         explicit_answers_payload = [
             answer.model_dump(mode="json")
@@ -251,10 +472,44 @@ class LangGraphTemplateEntryAgent:
             sheet_name,
             touched_cells=touched_cells_for_assignments(session_state.mapped_assignments, sheet_name),
         )
+        data_input_context = self._data_input_context(
+            session_state=session_state,
+            sheet_name=sheet_name,
+        )
+        transactions_tool_available = self._transactions_tool_available(
+            workbook_path=session_state.workbook_path,
+            sheet_name=sheet_name,
+        )
+        preloaded_template_context = read_preloaded_template_context(session_state.workbook_path)
+        ocr_context = self._structured_ocr_context(ocr_results) if context_stage == "ocr_results" else None
+        data_input_block = ""
+        if data_input_context is not None:
+            data_input_block = f"Populated Data Input sheet context already written into the workbook:\n{data_input_context}\n\n"
+        transactions_tool_block = ""
+        if transactions_tool_available:
+            transactions_tool_block = (
+                "Tool available: `query_transactions`\n"
+                "Use the `query_transactions` tool to inspect or aggregate the workbook's Transactions Raw "
+                "ledger as a read-only SQLite database before asking the user to total transaction rows.\n"
+                f"{transactions_query_schema_reference()}\n\n"
+            )
+        ocr_block = ""
+        if ocr_context is None:
+            ocr_block = "Structured OCR evidence for the document:\n- Not included in this pass.\n"
+        else:
+            ocr_block = (
+                "Structured OCR evidence for the document:\n"
+                f"{json.dumps(ocr_context, indent=2)}\n"
+            )
         return (
             f"Active workbook sheet: {sheet_name}\n\n"
+            f"{self._context_stage_instructions(context_stage)}\n\n"
             f"{sheet_reference_for_prompt(sheet_name)}\n\n"
             f"{workbook_context}\n\n"
+            f"{data_input_block}"
+            f"{transactions_tool_block}"
+            "Preloaded template data already present in this workbook before any agent writes:\n"
+            f"{json.dumps(preloaded_template_context, indent=2)}\n\n"
             "Confirmed user answers for this sheet:\n"
             f"{json.dumps(explicit_answers_payload, indent=2)}\n\n"
             "Agent-sourced decisions for this sheet:\n"
@@ -262,8 +517,7 @@ class LangGraphTemplateEntryAgent:
             "Agent-sourced decisions can come from a prior raw PDF re-review or an explicit user delegation. If they are present, resolve those targets yourself and avoid asking the same question again unless the sheet still cannot proceed safely.\n\n"
             "Prior mapped assignments already written for this sheet:\n"
             f"{json.dumps(prior_assignments, indent=2)}\n\n"
-            "Full OCR output JSON for the document:\n"
-            f"{json.dumps([result.model_dump(mode='json') for result in ocr_results], indent=2)}"
+            f"{ocr_block}"
         )
 
     def _build_raw_pdf_rereview_prompt(
@@ -284,6 +538,11 @@ class LangGraphTemplateEntryAgent:
             sheet_name,
             touched_cells=touched_cells_for_assignments(session_state.mapped_assignments, sheet_name),
         )
+        data_input_context = self._data_input_context(
+            session_state=session_state,
+            sheet_name=sheet_name,
+        )
+        preloaded_template_context = read_preloaded_template_context(session_state.workbook_path)
         raw_ocr_payload = [
             {
                 "page_number": result.page_number,
@@ -292,10 +551,18 @@ class LangGraphTemplateEntryAgent:
             }
             for result in ocr_results
         ]
+        data_input_block = ""
+        if data_input_context is not None:
+            data_input_block = f"Populated Data Input sheet context already written into the workbook:\n{data_input_context}\n\n"
         return (
             f"Active workbook sheet: {sheet_name}\n\n"
+            "Context stage: raw_pdf_review\n"
+            "This is the final fallback. Use workbook context first, then the raw OCR text below only to answer the pending question.\n\n"
             f"{sheet_reference_for_prompt(sheet_name)}\n\n"
             f"{workbook_context}\n\n"
+            f"{data_input_block}"
+            "Preloaded template data already present in this workbook before any agent writes:\n"
+            f"{json.dumps(preloaded_template_context, indent=2)}\n\n"
             "Prior explicit user answers for this sheet:\n"
             f"{json.dumps(explicit_answers_payload, indent=2)}\n\n"
             "Pending question JSON:\n"
@@ -313,6 +580,8 @@ class LangGraphTemplateEntryAgent:
         sheet_name: str,
         question: AgentQuestion,
         retry_notifier: RetryNotifier | None = None,
+        usage_notifier: UsageNotifier | None = None,
+        progress_notifier: ProgressNotifier | None = None,
     ) -> AgentAnswer | None:
         review = self._invoke_structured_with_retries(
             operation_name=f"Raw PDF re-review for {sheet_name}",
@@ -329,6 +598,8 @@ class LangGraphTemplateEntryAgent:
                 ),
             ],
             retry_notifier=retry_notifier,
+            usage_notifier=usage_notifier,
+            progress_notifier=progress_notifier,
         )
         if not review.answer_found or review.answer is None or not review.answer.strip():
             return None
@@ -348,17 +619,84 @@ class LangGraphTemplateEntryAgent:
             for answer in session_state.user_answers
         )
 
+    def _run_sheet_pass(
+        self,
+        *,
+        session_state: EntrySessionState,
+        ocr_results: list[PageOcrResult],
+        sheet_name: str,
+        context_stage: Literal["workbook_only", "ocr_results"],
+        retry_notifier: RetryNotifier | None,
+        usage_notifier: UsageNotifier | None,
+        progress_notifier: ProgressNotifier | None,
+    ) -> SheetEntryResult:
+        sheet_tools = self._sheet_tools(
+            session_state=session_state,
+            sheet_name=sheet_name,
+        )
+        graph_state = self._graph.invoke(
+            {
+                "sheet_name": sheet_name,
+                "prompt": self._build_prompt(
+                    session_state=session_state,
+                    ocr_results=ocr_results,
+                    sheet_name=sheet_name,
+                    context_stage=context_stage,
+                ),
+                "retry_notifier": retry_notifier,
+                "usage_notifier": usage_notifier,
+                "progress_notifier": progress_notifier,
+                "tools": sheet_tools,
+                "result": None,
+            }
+        )
+        result = graph_state["result"]
+        if result is None:
+            raise RuntimeError(f"Template entry graph did not produce a result for {sheet_name}.")
+        result.sheet_name = sheet_name
+        return result
+
+    def _initial_context_stage(
+        self,
+        *,
+        session_state: EntrySessionState,
+        sheet_name: str,
+    ) -> Literal["workbook_only", "ocr_results"]:
+        if sheet_name == "Data Input":
+            return "ocr_results"
+        if sheet_has_populated_writable_cells(session_state.workbook_path, "Data Input"):
+            return "workbook_only"
+        return "ocr_results"
+
+    def _should_escalate_to_ocr(
+        self,
+        *,
+        context_stage: Literal["workbook_only", "ocr_results"],
+        result: SheetEntryResult,
+    ) -> bool:
+        if context_stage != "workbook_only":
+            return False
+        return (
+            result.question is not None
+            or bool(result.unresolved_supported_targets)
+            or self._mapped_item_count(result) == 0
+        )
+
     def advance(
         self,
         session_state: EntrySessionState,
         ocr_results: list[PageOcrResult],
         retry_notifier: RetryNotifier | None = None,
+        usage_notifier: UsageNotifier | None = None,
+        progress_notifier: ProgressNotifier | None = None,
     ) -> EntrySessionState:
         return self._advance(
             session_state,
             ocr_results,
             allow_raw_pdf_rereview=True,
             retry_notifier=retry_notifier,
+            usage_notifier=usage_notifier,
+            progress_notifier=progress_notifier,
         )
 
     def _advance(
@@ -368,6 +706,8 @@ class LangGraphTemplateEntryAgent:
         *,
         allow_raw_pdf_rereview: bool,
         retry_notifier: RetryNotifier | None,
+        usage_notifier: UsageNotifier | None,
+        progress_notifier: ProgressNotifier | None,
     ) -> EntrySessionState:
         if session_state.current_sheet_index >= len(session_state.sheet_order):
             session_state.pending_question = None
@@ -375,14 +715,23 @@ class LangGraphTemplateEntryAgent:
             session_state.coverage_summary = coverage_summary_for_state(session_state)
             return session_state
 
+        if session_state.current_sheet_index == 0:
+            session_state.sheet_order = prioritize_data_input_sheet(session_state.sheet_order)
+
         sheet_name = session_state.sheet_order[session_state.current_sheet_index]
         if not ALLOWED_WRITE_CELLS_BY_SHEET.get(sheet_name):
+            skip_message = "No writable targets configured for this sheet."
+            if sheet_has_preloaded_template_data(session_state.workbook_path, sheet_name):
+                skip_message = (
+                    "No writable targets configured for this sheet. The locked template already "
+                    "pre-populates this sheet with starter data."
+                )
             _upsert_sheet_summary(
                 session_state,
                 SheetEntrySummary(
                     sheet_name=sheet_name,
                     status="skipped",
-                    message="No writable targets configured for this sheet.",
+                    message=skip_message,
                 )
             )
             session_state.current_sheet_index += 1
@@ -390,23 +739,29 @@ class LangGraphTemplateEntryAgent:
             session_state.completed = session_state.current_sheet_index >= len(session_state.sheet_order)
             return session_state
 
-        graph_state = self._graph.invoke(
-            {
-                "sheet_name": sheet_name,
-                "prompt": self._build_prompt(
-                    session_state=session_state,
-                    ocr_results=ocr_results,
-                    sheet_name=sheet_name,
-                ),
-                "retry_notifier": retry_notifier,
-                "result": None,
-            }
+        context_stage = self._initial_context_stage(
+            session_state=session_state,
+            sheet_name=sheet_name,
         )
-        result = graph_state["result"]
-        if result is None:
-            raise RuntimeError(f"Template entry graph did not produce a result for {sheet_name}.")
-
-        result.sheet_name = sheet_name
+        result = self._run_sheet_pass(
+            session_state=session_state,
+            ocr_results=ocr_results,
+            sheet_name=sheet_name,
+            context_stage=context_stage,
+            retry_notifier=retry_notifier,
+            usage_notifier=usage_notifier,
+            progress_notifier=progress_notifier,
+        )
+        if self._should_escalate_to_ocr(context_stage=context_stage, result=result):
+            result = self._run_sheet_pass(
+                session_state=session_state,
+                ocr_results=ocr_results,
+                sheet_name=sheet_name,
+                context_stage="ocr_results",
+                retry_notifier=retry_notifier,
+                usage_notifier=usage_notifier,
+                progress_notifier=progress_notifier,
+            )
         if result.question is not None and allow_raw_pdf_rereview:
             reviewed_answer = self._review_question_against_raw_pdf(
                 session_state=session_state,
@@ -414,16 +769,22 @@ class LangGraphTemplateEntryAgent:
                 sheet_name=sheet_name,
                 question=result.question,
                 retry_notifier=retry_notifier,
+                usage_notifier=usage_notifier,
+                progress_notifier=progress_notifier,
             )
             if reviewed_answer is not None:
                 session_state.user_answers.append(reviewed_answer)
-                return self._advance(
-                    session_state,
-                    ocr_results,
-                    allow_raw_pdf_rereview=False,
+                result = self._run_sheet_pass(
+                    session_state=session_state,
+                    ocr_results=ocr_results,
+                    sheet_name=sheet_name,
+                    context_stage="ocr_results",
                     retry_notifier=retry_notifier,
+                    usage_notifier=usage_notifier,
+                    progress_notifier=progress_notifier,
                 )
-            result.question.pdf_rereviewed = True
+            if result.question is not None:
+                result.question.pdf_rereviewed = True
 
         if (
             result.question is not None
@@ -476,7 +837,7 @@ class LangGraphTemplateEntryAgent:
 
 
 def default_sheet_order() -> list[str]:
-    return list(TEMPLATE_SHEET_ORDER)
+    return prioritize_data_input_sheet(list(TEMPLATE_SHEET_ORDER))
 
 
 def answer_from_question(

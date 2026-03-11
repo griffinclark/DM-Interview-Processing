@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import UTC, datetime
+import inspect
 import json
 from pathlib import Path
 from queue import Empty, Queue
@@ -24,7 +25,6 @@ from planlock.models import (
     EntrySessionState,
     ImportArtifacts,
     ImportWarning,
-    PhaseOneCache,
     PageOcrResult,
     ReviewReport,
     RunEvent,
@@ -182,6 +182,7 @@ class JobRunner:
         current_sheet_name: str,
         stage_completed: int,
         stage_total: int,
+        agent_total_tokens: int | None = None,
     ) -> Iterable[RunEvent]:
         while True:
             try:
@@ -224,6 +225,8 @@ class JobRunner:
             yield RunEvent(
                 stage=Stage.DATA_ENTRY,
                 message=message,
+                sheet_name=current_sheet_name,
+                agent_total_tokens=agent_total_tokens,
                 detail_message=detail_message,
                 severity=Severity.WARNING,
                 stage_completed=stage_completed,
@@ -240,34 +243,18 @@ class JobRunner:
             )
 
     @staticmethod
-    def persist_phase_one_cache(
-        path: Path,
-        *,
-        source_filename: str,
-        ocr_results: list[PageOcrResult],
-    ) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        cache_payload = PhaseOneCache(
-            source_filename=source_filename,
-            page_total=len(ocr_results),
-            ocr_results=ocr_results,
-        )
-        path.write_text(
-            json.dumps(cache_payload.model_dump(mode="json"), indent=2),
-            encoding="utf-8",
-        )
+    def _drain_entry_progress_queue(progress_queue: Queue[dict[str, object]]) -> str | None:
+        latest_progress_message: str | None = None
+        while True:
+            try:
+                payload = progress_queue.get_nowait()
+            except Empty:
+                break
 
-    @staticmethod
-    def load_phase_one_cache(path: Path) -> PhaseOneCache:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(payload, list):
-            ocr_results = [PageOcrResult.model_validate(item) for item in payload]
-            return PhaseOneCache(
-                source_filename=path.name,
-                page_total=len(ocr_results),
-                ocr_results=ocr_results,
-            )
-        return PhaseOneCache.model_validate(payload)
+            progress_message = str(payload.get("progress_message") or "").strip()
+            if progress_message:
+                latest_progress_message = progress_message
+        return latest_progress_message
 
     def _run_ocr(self, pdf_bytes: bytes) -> Iterable[RunEvent]:
         provider_label = self.settings.llm_provider_display_name()
@@ -461,29 +448,41 @@ class JobRunner:
         for summary in state.sheet_summaries:
             summary.touched_cells = touched_cells_for_assignments(assignments, summary.sheet_name)
 
+    def _entry_artifacts(
+        self,
+        *,
+        state: EntrySessionState,
+        job_dir: Path,
+        pending_question=None,
+    ) -> ImportArtifacts:
+        return ImportArtifacts(
+            success=False,
+            job_id=state.job_id,
+            job_dir=job_dir,
+            output_workbook_path=state.workbook_path if state.workbook_path.exists() else None,
+            entry_state_path=self._entry_state_path(job_dir),
+            ocr_results_path=state.ocr_results_path,
+            pending_question=pending_question,
+        )
+
     def _pause_event(
         self,
         *,
         state: EntrySessionState,
         job_dir: Path,
         message: str,
+        agent_total_tokens: int | None = None,
     ) -> RunEvent:
         return RunEvent(
             stage=Stage.DATA_ENTRY,
             message=message,
+            sheet_name=state.pending_question.sheet_name if state.pending_question is not None else None,
+            agent_total_tokens=agent_total_tokens,
             severity=Severity.WARNING,
             stage_completed=state.current_sheet_index,
             stage_total=len(state.sheet_order),
             phase="paused",
-            artifacts=ImportArtifacts(
-                success=False,
-                job_id=state.job_id,
-                job_dir=job_dir,
-                output_workbook_path=state.workbook_path if state.workbook_path.exists() else None,
-                entry_state_path=self._entry_state_path(job_dir),
-                ocr_results_path=state.ocr_results_path,
-                pending_question=state.pending_question,
-            ),
+            artifacts=self._entry_artifacts(state=state, job_dir=job_dir, pending_question=state.pending_question),
         )
 
     def _finalize_job(
@@ -634,16 +633,39 @@ class JobRunner:
         ocr_results = load_ocr_results(state.ocr_results_path)
         stage_total = len(state.sheet_order)
         provider_label = self.settings.llm_provider_display_name()
+        agent_total_tokens = 0
+        usage_lock = threading.Lock()
+
+        def total_agent_tokens() -> int:
+            with usage_lock:
+                return agent_total_tokens
+
         yield RunEvent(
             stage=Stage.DATA_ENTRY,
             message="Beginning workbook entry.",
+            agent_total_tokens=total_agent_tokens(),
             stage_completed=state.current_sheet_index,
             stage_total=stage_total,
+            artifacts=self._entry_artifacts(state=state, job_dir=job_dir),
         )
 
         while not state.completed and state.pending_question is None:
             current_sheet_name = state.sheet_order[state.current_sheet_index]
             retry_queue: Queue[dict[str, object]] = Queue()
+            progress_queue: Queue[dict[str, object]] = Queue()
+            entry_agent = self._entry_agent()
+
+            yield RunEvent(
+                stage=Stage.DATA_ENTRY,
+                message=f"LangGraph is working on {current_sheet_name}.",
+                sheet_name=current_sheet_name,
+                agent_total_tokens=total_agent_tokens(),
+                detail_message="Reviewing OCR evidence, workbook context, and prior answers before proposing writes.",
+                stage_completed=state.current_sheet_index,
+                stage_total=stage_total,
+                phase="start",
+                artifacts=self._entry_artifacts(state=state, job_dir=job_dir),
+            )
 
             def notify_retry(
                 operation_name: str,
@@ -664,12 +686,40 @@ class JobRunner:
                     }
                 )
 
+            def notify_usage(_operation_name: str, usage: dict[str, int]) -> None:
+                nonlocal agent_total_tokens
+                total_tokens = int(usage.get("total_tokens") or 0)
+                if total_tokens <= 0:
+                    return
+                with usage_lock:
+                    agent_total_tokens += total_tokens
+
+            def notify_progress(_operation_name: str, progress_message: str) -> None:
+                progress_text = str(progress_message).strip()
+                if not progress_text:
+                    return
+                progress_queue.put({"progress_message": progress_text})
+
+            advance_kwargs: dict[str, object] = {"retry_notifier": notify_retry}
+            try:
+                advance_parameters = inspect.signature(entry_agent.advance).parameters
+            except (TypeError, ValueError):
+                advance_parameters = {}
+            accepts_var_kwargs = any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in advance_parameters.values()
+            )
+            if accepts_var_kwargs or "usage_notifier" in advance_parameters:
+                advance_kwargs["usage_notifier"] = notify_usage
+            if accepts_var_kwargs or "progress_notifier" in advance_parameters:
+                advance_kwargs["progress_notifier"] = notify_progress
+
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="entry-pass") as executor:
                 future = executor.submit(
-                    self._entry_agent().advance,
+                    entry_agent.advance,
                     state,
                     ocr_results,
-                    retry_notifier=notify_retry,
+                    **advance_kwargs,
                 )
                 pending = {future}
                 while pending:
@@ -681,13 +731,30 @@ class JobRunner:
                             current_sheet_name=current_sheet_name,
                             stage_completed=state.current_sheet_index,
                             stage_total=stage_total,
+                            agent_total_tokens=total_agent_tokens(),
                         )
                     )
-                    yield from retry_events
-                    if not done and not retry_events:
+                    latest_progress_message = self._drain_entry_progress_queue(progress_queue)
+                    if retry_events:
+                        yield from retry_events
+                        continue
+                    if latest_progress_message is not None:
                         yield RunEvent(
                             stage=Stage.DATA_ENTRY,
                             message="Workbook entry in progress.",
+                            sheet_name=current_sheet_name,
+                            agent_total_tokens=total_agent_tokens(),
+                            progress_message=latest_progress_message,
+                            stage_completed=state.current_sheet_index,
+                            stage_total=stage_total,
+                            phase="heartbeat",
+                        )
+                    if not done and latest_progress_message is None:
+                        yield RunEvent(
+                            stage=Stage.DATA_ENTRY,
+                            message="Workbook entry in progress.",
+                            sheet_name=current_sheet_name,
+                            agent_total_tokens=total_agent_tokens(),
                             stage_completed=state.current_sheet_index,
                             stage_total=stage_total,
                             phase="heartbeat",
@@ -710,6 +777,8 @@ class JobRunner:
                         yield RunEvent(
                             stage=Stage.DATA_ENTRY,
                             message=message,
+                            sheet_name=current_sheet_name,
+                            agent_total_tokens=total_agent_tokens(),
                             detail_message=str(root_cause),
                             severity=Severity.ERROR,
                             stage_completed=state.current_sheet_index,
@@ -724,6 +793,7 @@ class JobRunner:
                     current_sheet_name=current_sheet_name,
                     stage_completed=state.current_sheet_index,
                     stage_total=stage_total,
+                    agent_total_tokens=total_agent_tokens(),
                 )
 
             self._refresh_assignment_state(state)
@@ -734,12 +804,15 @@ class JobRunner:
                     state=state,
                     job_dir=job_dir,
                     message=f"Workbook entry paused on {current_sheet_name}: {state.pending_question.prompt}",
+                    agent_total_tokens=total_agent_tokens(),
                 )
                 return
 
             yield RunEvent(
                 stage=Stage.DATA_ENTRY,
                 message=f"Completed sheet {current_sheet_name}.",
+                sheet_name=current_sheet_name,
+                agent_total_tokens=total_agent_tokens(),
                 stage_completed=state.current_sheet_index,
                 stage_total=stage_total,
             )
@@ -748,6 +821,7 @@ class JobRunner:
             yield RunEvent(
                 stage=Stage.DATA_ENTRY,
                 message="Workbook entry complete.",
+                agent_total_tokens=total_agent_tokens(),
                 stage_completed=stage_total,
                 stage_total=stage_total,
                 phase="complete",
@@ -790,11 +864,6 @@ class JobRunner:
         source_pdf.write_bytes(pdf_bytes)
 
         ocr_results = yield from self._run_ocr(pdf_bytes)
-        self.persist_phase_one_cache(
-            self.settings.debug_cache_path,
-            source_filename=source_pdf.name,
-            ocr_results=ocr_results,
-        )
         yield from self._start_entry_job(
             job_id=job_id,
             job_dir=job_dir,
@@ -802,24 +871,13 @@ class JobRunner:
             ocr_results=ocr_results,
         )
 
-    def start_job_from_cache(
+    def resume_job(
         self,
-        cache_path: Path | None = None,
+        job_id: str,
+        answer: str,
         *,
-        cache: PhaseOneCache | None = None,
+        source: str = "option",
     ) -> Iterable[RunEvent]:
-        self.settings.ensure_runtime_dirs()
-        template_sha = self.settings.validate_template_lock()
-        job_id, job_dir = self._job_dir()
-        loaded_cache = cache or self.load_phase_one_cache(cache_path or self.settings.debug_cache_path)
-        yield from self._start_entry_job(
-            job_id=job_id,
-            job_dir=job_dir,
-            template_sha=template_sha,
-            ocr_results=loaded_cache.ocr_results,
-        )
-
-    def resume_job(self, job_id: str, answer: str, *, source: str = "option") -> Iterable[RunEvent]:
         self.settings.ensure_runtime_dirs()
         job_dir = self._job_dir_for(job_id)
         state_path = self._entry_state_path(job_dir)
@@ -845,6 +903,7 @@ class JobRunner:
         yield RunEvent(
             stage=Stage.DATA_ENTRY,
             message=resume_message,
+            sheet_name=answered_sheet,
             stage_completed=state.current_sheet_index,
             stage_total=len(state.sheet_order),
         )
