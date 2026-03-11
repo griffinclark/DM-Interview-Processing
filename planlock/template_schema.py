@@ -176,6 +176,16 @@ EDUCATION_BLOCKS = [
 
 PORTFOLIO_BLOCKS = RETIREMENT_BLOCKS + TAXABLE_BLOCKS + EDUCATION_BLOCKS
 
+TEMPLATE_SHEET_ORDER = [
+    "Data Input",
+    "Net Worth",
+    "Transactions Raw",
+    "Expenses",
+    "Retirement Accounts",
+    "Taxable Accounts",
+    "Education Accounts",
+]
+
 
 ALLOWED_WRITE_CELLS_BY_SHEET: dict[str, set[str]] = {}
 
@@ -270,3 +280,37 @@ def schema_reference_for_prompt() -> str:
         ]
     )
 
+
+def sheet_reference_for_prompt(sheet_name: str) -> str:
+    lines = [f"Sheet: {sheet_name}"]
+    allowed_cells = sorted(ALLOWED_WRITE_CELLS_BY_SHEET.get(sheet_name, set()))
+    if allowed_cells:
+        lines.append("Allowed writable cells:")
+        lines.append(", ".join(allowed_cells))
+    allowed_formulas = sorted(ALLOWED_FORMULA_CELLS_BY_SHEET.get(sheet_name, set()))
+    if allowed_formulas:
+        lines.append("Cells that must stay formula-driven when derived values are needed:")
+        lines.append(", ".join(allowed_formulas))
+    if sheet_name == "Expenses":
+        lines.append("Expense row blocks:")
+        lines.extend(
+            f"- {category}: rows {start_row}-{end_row}"
+            for category, (start_row, end_row) in EXPENSE_ROW_BLOCKS.items()
+        )
+    if sheet_name == "Data Input":
+        field_lines = [
+            f"- {key} -> {cell}"
+            for key, (field_sheet_name, cell) in sorted(FIELD_TARGETS.items())
+            if field_sheet_name == sheet_name
+        ]
+        if field_lines:
+            lines.append("Direct field targets:")
+            lines.extend(field_lines)
+    if sheet_name in {"Retirement Accounts", "Taxable Accounts", "Education Accounts"}:
+        blocks = [block for block in PORTFOLIO_BLOCKS if block.sheet_name == sheet_name]
+        lines.append("Portfolio blocks:")
+        lines.extend(
+            f"- {block.owner_section}: account row {block.account_row}, holdings {block.holding_start_row}-{block.holding_end_row}"
+            for block in blocks
+        )
+    return "\n".join(lines)

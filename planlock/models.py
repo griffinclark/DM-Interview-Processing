@@ -120,6 +120,42 @@ class PageMappingResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class QuestionOption(BaseModel):
+    label: str
+    value: str
+    description: str | None = None
+
+
+class AgentQuestion(BaseModel):
+    id: str
+    sheet_name: str
+    prompt: str
+    rationale: str
+    affected_targets: list[str] = Field(default_factory=list)
+    options: list[QuestionOption] = Field(default_factory=list)
+    allow_free_text: bool = True
+    pdf_rereviewed: bool = False
+
+
+class AgentAnswer(BaseModel):
+    question_id: str
+    sheet_name: str
+    answer: str
+    source: Literal["option", "free_text", "agent", "raw_pdf_review"] = "option"
+    affected_targets: list[str] = Field(default_factory=list)
+
+
+class SheetEntryResult(BaseModel):
+    sheet_name: str
+    mapped_fields: list[FieldCandidate] = Field(default_factory=list)
+    expenses: list[ExpenseCandidate] = Field(default_factory=list)
+    accounts: list[AccountCandidate] = Field(default_factory=list)
+    holdings: list[HoldingCandidate] = Field(default_factory=list)
+    unresolved_supported_targets: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+    question: AgentQuestion | None = None
+
+
 class ImportWarning(BaseModel):
     code: str
     message: str
@@ -162,6 +198,43 @@ class CalculationValidationResult(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+class SheetEntrySummary(BaseModel):
+    sheet_name: str
+    status: Literal["completed", "needs_input", "skipped"] = "completed"
+    mapped_count: int = 0
+    unresolved_count: int = 0
+    touched_cells: list[str] = Field(default_factory=list)
+    message: str | None = None
+
+
+class CoverageSummary(BaseModel):
+    supported_target_count: int = 0
+    unresolved_supported_target_count: int = 0
+    coverage_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
+    critical_sheet_names: list[str] = Field(default_factory=list)
+    unresolved_critical_sheet_names: list[str] = Field(default_factory=list)
+
+
+class EntrySessionState(BaseModel):
+    job_id: str
+    template_sha256: str
+    workbook_path: Path
+    ocr_results_path: Path
+    current_sheet_index: int = 0
+    sheet_order: list[str] = Field(default_factory=list)
+    pending_question: AgentQuestion | None = None
+    questions_asked: list[AgentQuestion] = Field(default_factory=list)
+    user_answers: list[AgentAnswer] = Field(default_factory=list)
+    sheet_results: list[SheetEntryResult] = Field(default_factory=list)
+    sheet_summaries: list[SheetEntrySummary] = Field(default_factory=list)
+    mapped_assignments: list[CellAssignment] = Field(default_factory=list)
+    unmapped_items: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
+    coverage_summary: CoverageSummary = Field(default_factory=CoverageSummary)
+    review_required_reasons: list[str] = Field(default_factory=list)
+    completed: bool = False
+
+
 class ReviewReport(BaseModel):
     job_id: str
     template_sha256: str
@@ -170,6 +243,11 @@ class ReviewReport(BaseModel):
     mapped_assignments: list[CellAssignment] = Field(default_factory=list)
     unmapped_items: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
+    sheet_summaries: list[SheetEntrySummary] = Field(default_factory=list)
+    user_answers: list[AgentAnswer] = Field(default_factory=list)
+    questions_asked: list[AgentQuestion] = Field(default_factory=list)
+    coverage_summary: CoverageSummary | None = None
+    review_required_reasons: list[str] = Field(default_factory=list)
     drift_check: TemplateDriftCheckResult | None = None
     calculation_validation: CalculationValidationResult | None = None
 
@@ -181,11 +259,21 @@ class ImportArtifacts(BaseModel):
     output_workbook_path: Path | None = None
     review_report_path: Path | None = None
     review_report: ReviewReport | None = None
+    entry_state_path: Path | None = None
+    ocr_results_path: Path | None = None
+    pending_question: AgentQuestion | None = None
+
+
+class PhaseOneCache(BaseModel):
+    source_filename: str
+    page_total: int = 0
+    ocr_results: list[PageOcrResult] = Field(default_factory=list)
 
 
 class RunEvent(BaseModel):
     stage: Stage
     message: str
+    detail_message: str | None = None
     severity: Severity = Severity.INFO
     stage_completed: int = 0
     stage_total: int = 1
@@ -197,5 +285,5 @@ class RunEvent(BaseModel):
     max_attempts: int | None = None
     retry_delay_seconds: float | None = None
     retry_reason: Literal["rate_limit", "transient"] | None = None
-    phase: Literal["start", "retry", "complete", "failed", "heartbeat"] | None = None
+    phase: Literal["start", "retry", "complete", "failed", "heartbeat", "paused"] | None = None
     artifacts: ImportArtifacts | None = None

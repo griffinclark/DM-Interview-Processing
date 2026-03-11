@@ -2,18 +2,23 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from queue import Queue
 import threading
 import time
 
 import fitz
+from openpyxl import load_workbook
+import pytest
 
 from planlock.config import Settings
 from planlock.job_runner import JobRunner
 from planlock.models import (
+    AgentQuestion,
     ExpenseCandidate,
     FieldCandidate,
-    PageMappingResult,
     PageOcrResult,
+    QuestionOption,
+    SheetEntryResult,
     Stage,
     ValueKind,
 )
@@ -32,53 +37,143 @@ class FakeExtractionClient:
             confidence=0.99,
         )
 
-    def map_page(self, page, ocr_result, retry_notifier=None):
-        return PageMappingResult(
-            page_number=page.page_number,
-            mapped_fields=[
-                FieldCandidate(
-                    target_key="profile.client_1.first_name",
-                    value="Taylor",
-                    value_kind=ValueKind.STRING,
-                    page_number=page.page_number,
-                    source_excerpt="Taylor",
-                    confidence=0.95,
-                )
-            ],
-            expenses=[
-                ExpenseCandidate(
-                    category="Travel",
-                    monthly_amount=1250.0,
-                    label="Imported Target",
-                    page_number=page.page_number,
-                    source_excerpt="Travel target $1,250",
-                    confidence=0.96,
-                    comment="Suggested target chosen over current value.",
-                )
-            ],
-            accounts=[],
-            holdings=[],
-            unmapped_items=[],
-            warnings=[],
-        )
+
+class FakeRateLimitError(Exception):
+    status_code = 429
 
 
-class ConcurrencyTrackingExtractionClient(FakeExtractionClient):
+class TrackingTemplateEntryAgent:
     def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.active_calls = 0
-        self.peak_calls = 0
+        self.sheet_calls: list[str] = []
 
-    def ocr_page(self, page, retry_notifier=None):
-        with self._lock:
-            self.active_calls += 1
-            self.peak_calls = max(self.peak_calls, self.active_calls)
-        try:
-            time.sleep(0.05)
-            return super().ocr_page(page, retry_notifier=retry_notifier)
-        finally:
-            with self._lock:
-                self.active_calls -= 1
+    def advance(self, state, ocr_results, retry_notifier=None):
+        sheet_name = state.sheet_order[state.current_sheet_index]
+        self.sheet_calls.append(sheet_name)
+        if sheet_name == "Data Input":
+            state.sheet_results.append(
+                SheetEntryResult(
+                    sheet_name=sheet_name,
+                    mapped_fields=[
+                        FieldCandidate(
+                            target_key="profile.client_1.first_name",
+                            value="Taylor",
+                            value_kind=ValueKind.STRING,
+                            page_number=1,
+                            source_excerpt="Taylor",
+                            confidence=0.95,
+                        )
+                    ],
+                )
+            )
+        elif sheet_name == "Expenses":
+            state.sheet_results.append(
+                SheetEntryResult(
+                    sheet_name=sheet_name,
+                    expenses=[
+                        ExpenseCandidate(
+                            category="Travel",
+                            monthly_amount=1250.0,
+                            label="Imported Target",
+                            page_number=1,
+                            source_excerpt="Travel target $1,250",
+                            confidence=0.96,
+                            comment="Suggested target chosen over current value.",
+                        )
+                    ],
+                )
+            )
+        state.current_sheet_index += 1
+        state.completed = state.current_sheet_index >= len(state.sheet_order)
+        return state
+
+
+class QuestioningTemplateEntryAgent(TrackingTemplateEntryAgent):
+    def advance(self, state, ocr_results, retry_notifier=None):
+        sheet_name = state.sheet_order[state.current_sheet_index]
+        self.sheet_calls.append(sheet_name)
+        if sheet_name == "Data Input" and not any(answer.sheet_name == "Data Input" for answer in state.user_answers):
+            state.pending_question = AgentQuestion(
+                id="data-input-name",
+                sheet_name=sheet_name,
+                prompt="Which first name should populate client 1?",
+                rationale="The OCR shows two possible names for client 1.",
+                affected_targets=["profile.client_1.first_name"],
+                options=[
+                    QuestionOption(label="Taylor", value="Taylor"),
+                    QuestionOption(label="Tyler", value="Tyler"),
+                ],
+            )
+            return state
+
+        if sheet_name == "Data Input":
+            chosen_name = next(answer.answer for answer in state.user_answers if answer.sheet_name == "Data Input")
+            state.sheet_results.append(
+                SheetEntryResult(
+                    sheet_name=sheet_name,
+                    mapped_fields=[
+                        FieldCandidate(
+                            target_key="profile.client_1.first_name",
+                            value=chosen_name,
+                            value_kind=ValueKind.STRING,
+                            page_number=1,
+                            source_excerpt=chosen_name,
+                            confidence=0.95,
+                        )
+                    ],
+                )
+            )
+        elif sheet_name == "Expenses":
+            state.sheet_results.append(
+                SheetEntryResult(
+                    sheet_name=sheet_name,
+                    expenses=[
+                        ExpenseCandidate(
+                            category="Travel",
+                            monthly_amount=1250.0,
+                            label="Imported Target",
+                            page_number=1,
+                            source_excerpt="Travel target $1,250",
+                            confidence=0.96,
+                        )
+                    ],
+                )
+            )
+        state.current_sheet_index += 1
+        state.completed = state.current_sheet_index >= len(state.sheet_order)
+        return state
+
+
+class LowCoverageTemplateEntryAgent(TrackingTemplateEntryAgent):
+    def advance(self, state, ocr_results, retry_notifier=None):
+        sheet_name = state.sheet_order[state.current_sheet_index]
+        self.sheet_calls.append(sheet_name)
+        if sheet_name == "Data Input":
+            state.sheet_results.append(
+                SheetEntryResult(
+                    sheet_name=sheet_name,
+                    unresolved_supported_targets=["profile.client_1.first_name"],
+                    warnings=["Need user confirmation before writing profile values."],
+                )
+            )
+        state.current_sheet_index += 1
+        state.completed = state.current_sheet_index >= len(state.sheet_order)
+        return state
+
+
+class RetryingTemplateEntryAgent(TrackingTemplateEntryAgent):
+    def advance(self, state, ocr_results, retry_notifier=None):
+        if retry_notifier is not None:
+            retry_notifier(
+                "Workbook entry for Data Input",
+                2,
+                7,
+                10.0,
+                FakeRateLimitError(
+                    "Error code: 429 - {'type': 'error', 'error': {'type': 'rate_limit_error'}}"
+                ),
+            )
+        time.sleep(0.2)
+        return super().advance(state, ocr_results, retry_notifier=retry_notifier)
 
 
 class StaggeredConcurrencyExtractionClient(FakeExtractionClient):
@@ -106,6 +201,11 @@ class SlowExtractionClient(FakeExtractionClient):
         return super().ocr_page(page, retry_notifier=retry_notifier)
 
 
+class FailingExtractionClient:
+    def ocr_page(self, page, retry_notifier=None):
+        raise RuntimeError("OCR page 1: 1 validation error for PageOcrResult")
+
+
 def _make_pdf_bytes(page_count: int = 1) -> bytes:
     document = fitz.open()
     for page_number in range(1, page_count + 1):
@@ -117,10 +217,21 @@ def _make_pdf_bytes(page_count: int = 1) -> bytes:
     return document.tobytes()
 
 
-def test_job_runner_emits_all_three_stages(tmp_path: Path) -> None:
-    settings = Settings.from_env()
+def _settings(tmp_path: Path, **kwargs) -> Settings:
+    settings = replace(
+        Settings.from_env(),
+        jobs_dir=tmp_path / "jobs",
+        debug_cache_path=tmp_path / "debug_cache.txt",
+        **kwargs,
+    )
     settings.ensure_runtime_dirs()
-    runner = JobRunner(settings, extraction_client=FakeExtractionClient())
+    return settings
+
+
+def test_job_runner_emits_all_three_stages_and_keeps_derived_values_as_formulas(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    agent = TrackingTemplateEntryAgent()
+    runner = JobRunner(settings, extraction_client=FakeExtractionClient(), entry_agent=agent)
     events = list(runner.run(_make_pdf_bytes(), "test.pdf"))
 
     stages = [event.stage for event in events]
@@ -130,11 +241,14 @@ def test_job_runner_emits_all_three_stages(tmp_path: Path) -> None:
     assert events[-1].artifacts is not None
     assert events[-1].artifacts.review_report is not None
     assert events[-1].artifacts.review_report.success
+    workbook = load_workbook(events[-1].artifacts.output_workbook_path)
+    assert workbook["Data Input"]["C6"].value == "Taylor"
+    assert workbook["Expenses"]["D55"].value == 1250.0
+    assert workbook["Expenses"]["C55"].value == '=IF(D55="","",D55*12)'
 
 
 def test_job_runner_refills_finished_lanes_without_waiting_for_a_batch(tmp_path: Path) -> None:
-    settings = replace(Settings.from_env(), ocr_parallel_workers=5)
-    settings.ensure_runtime_dirs()
+    settings = _settings(tmp_path, ocr_parallel_workers=5)
     client = StaggeredConcurrencyExtractionClient(
         page_delays={
             1: 0.01,
@@ -145,7 +259,7 @@ def test_job_runner_refills_finished_lanes_without_waiting_for_a_batch(tmp_path:
             6: 0.01,
         }
     )
-    runner = JobRunner(settings, extraction_client=client)
+    runner = JobRunner(settings, extraction_client=client, entry_agent=TrackingTemplateEntryAgent())
     events = list(runner.run(_make_pdf_bytes(page_count=6), "test.pdf"))
 
     ocr_start_events = [event for event in events if event.stage == Stage.OCR and event.phase == "start"]
@@ -170,10 +284,177 @@ def test_job_runner_refills_finished_lanes_without_waiting_for_a_batch(tmp_path:
 
 
 def test_job_runner_emits_heartbeat_events_while_ocr_is_waiting(tmp_path: Path) -> None:
-    settings = replace(Settings.from_env(), ocr_parallel_workers=1)
-    settings.ensure_runtime_dirs()
-    runner = JobRunner(settings, extraction_client=SlowExtractionClient())
+    settings = _settings(tmp_path, ocr_parallel_workers=1)
+    runner = JobRunner(settings, extraction_client=SlowExtractionClient(), entry_agent=TrackingTemplateEntryAgent())
 
     events = list(runner.run(_make_pdf_bytes(), "test.pdf"))
 
     assert any(event.phase == "heartbeat" for event in events)
+
+
+def test_job_runner_persists_ocr_results_and_resumes_after_question(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    runner = JobRunner(
+        settings,
+        extraction_client=FakeExtractionClient(),
+        entry_agent=QuestioningTemplateEntryAgent(),
+    )
+
+    start_events = list(runner.start_job(_make_pdf_bytes(), "test.pdf"))
+    paused_event = start_events[-1]
+
+    assert paused_event.phase == "paused"
+    assert paused_event.artifacts is not None
+    assert paused_event.artifacts.pending_question is not None
+    assert paused_event.artifacts.entry_state_path is not None
+    assert paused_event.artifacts.entry_state_path.exists()
+    assert paused_event.artifacts.ocr_results_path is not None
+    assert paused_event.artifacts.ocr_results_path.exists()
+    assert settings.debug_cache_path.exists()
+
+    cache = runner.load_phase_one_cache(settings.debug_cache_path)
+    assert cache.source_filename == "test.pdf"
+    assert len(cache.ocr_results) == 1
+
+    resume_events = list(runner.resume_job(paused_event.artifacts.job_id, "Taylor"))
+    assert resume_events[-1].artifacts is not None
+    assert resume_events[-1].artifacts.review_report is not None
+    assert resume_events[-1].artifacts.review_report.user_answers[0].answer == "Taylor"
+    assert resume_events[-1].artifacts.review_report.success
+
+
+def test_job_runner_can_delegate_question_back_to_agent(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    runner = JobRunner(
+        settings,
+        extraction_client=FakeExtractionClient(),
+        entry_agent=QuestioningTemplateEntryAgent(),
+    )
+
+    start_events = list(runner.start_job(_make_pdf_bytes(), "test.pdf"))
+    paused_event = start_events[-1]
+
+    resume_events = list(runner.resume_job(paused_event.artifacts.job_id, "", source="agent"))
+
+    assert resume_events[0].message == "Letting the agent resolve Data Input. Resuming workbook entry."
+    assert resume_events[-1].artifacts is not None
+    assert resume_events[-1].artifacts.review_report is not None
+    assert resume_events[-1].artifacts.review_report.user_answers[0].source == "agent"
+    assert resume_events[-1].artifacts.review_report.success
+
+
+def test_job_runner_can_start_phase_two_from_debug_cache(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    runner = JobRunner(settings, extraction_client=FakeExtractionClient(), entry_agent=TrackingTemplateEntryAgent())
+
+    list(runner.start_job(_make_pdf_bytes(), "test.pdf"))
+    cached_events = list(runner.start_job_from_cache(settings.debug_cache_path))
+
+    assert settings.debug_cache_path.exists()
+    assert cached_events
+    assert cached_events[0].stage == Stage.DATA_ENTRY
+    assert all(event.stage != Stage.OCR for event in cached_events)
+    assert cached_events[-1].artifacts is not None
+    assert cached_events[-1].artifacts.review_report is not None
+    assert cached_events[-1].artifacts.review_report.success
+
+
+def test_job_runner_traverses_template_in_sheet_order(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    agent = TrackingTemplateEntryAgent()
+    runner = JobRunner(settings, extraction_client=FakeExtractionClient(), entry_agent=agent)
+
+    list(runner.run(_make_pdf_bytes(), "test.pdf"))
+
+    assert agent.sheet_calls == [
+        "Data Input",
+        "Net Worth",
+        "Transactions Raw",
+        "Expenses",
+        "Retirement Accounts",
+        "Taxable Accounts",
+        "Education Accounts",
+    ]
+
+
+def test_job_runner_marks_low_coverage_runs_for_review(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    runner = JobRunner(
+        settings,
+        extraction_client=FakeExtractionClient(),
+        entry_agent=LowCoverageTemplateEntryAgent(),
+    )
+
+    events = list(runner.run(_make_pdf_bytes(), "test.pdf"))
+    report = events[-1].artifacts.review_report
+
+    assert not report.success
+    assert report.review_required_reasons
+    assert report.coverage_summary is not None
+    assert report.coverage_summary.unresolved_supported_target_count > 0
+
+
+def test_job_runner_surfaces_workbook_rate_limit_retries(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    runner = JobRunner(
+        settings,
+        extraction_client=FakeExtractionClient(),
+        entry_agent=RetryingTemplateEntryAgent(),
+    )
+
+    events = list(runner.run(_make_pdf_bytes(), "test.pdf"))
+    retry_events = [
+        event
+        for event in events
+        if event.stage == Stage.DATA_ENTRY and event.phase == "retry"
+    ]
+
+    assert retry_events
+    assert retry_events[0].retry_reason == "rate_limit"
+    assert retry_events[0].retry_delay_seconds == 10.0
+    assert retry_events[0].attempt_number == 2
+    assert retry_events[0].max_attempts == 7
+    assert "OpenAI rate limit hit while filling Data Input." in retry_events[0].message
+    assert "rate_limit_error" in str(retry_events[0].detail_message)
+
+
+def test_retry_event_keeps_raw_error_in_detail_message() -> None:
+    retry_queue: Queue[dict[str, object]] = Queue()
+    retry_queue.put(
+        {
+            "page_number": 1,
+            "pipe_number": 1,
+            "attempt_number": 2,
+            "max_attempts": 3,
+            "retry_delay_seconds": 2.0,
+            "detail_message": "OCR page 1: 1 validation error for PageOcrResult",
+            "retry_reason": "transient",
+        }
+    )
+
+    events = list(JobRunner._drain_retry_queue(retry_queue, completed_pages=0, total_pages=23, pipe_total=3))
+
+    assert len(events) == 1
+    assert events[0].message == "Restarting lane 1 for page 1/23 (pass 2/3) after 2.0s."
+    assert events[0].detail_message == "OCR page 1: 1 validation error for PageOcrResult"
+
+
+def test_job_runner_raises_sanitized_page_failure(tmp_path: Path) -> None:
+    settings = _settings(tmp_path)
+    runner = JobRunner(
+        settings,
+        extraction_client=FailingExtractionClient(),
+        entry_agent=TrackingTemplateEntryAgent(),
+    )
+    events = runner.run(_make_pdf_bytes(), "test.pdf")
+    emitted = []
+
+    with pytest.raises(RuntimeError, match=r"Page review failed for page 1/1 in lane 1\.") as exc_info:
+        for event in events:
+            emitted.append(event)
+
+    assert "validation error" not in str(exc_info.value)
+    failed_event = emitted[-1]
+    assert failed_event.phase == "failed"
+    assert failed_event.message == "Page review failed for page 1/1 in lane 1."
+    assert failed_event.detail_message == "OCR page 1: 1 validation error for PageOcrResult"
