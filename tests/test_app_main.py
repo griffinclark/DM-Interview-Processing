@@ -229,10 +229,14 @@ def test_build_provider_selector_markup_uses_external_logo_images() -> None:
         'src="https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRlh7pFp_23fKHEyUCA6K6V44mSYZNcboaY9A&amp;s"'
         in markup
     )
+    assert "provider-card is-selected" in markup
+    assert "provider-card is-disabled" in markup
+    assert ">Active<" in markup
+    assert ">Unavailable<" in markup
     assert "<svg" not in markup
 
 
-def test_render_work_area_copy_only_mentions_provider_and_parallel_lanes(monkeypatch) -> None:
+def test_render_work_area_copy_only_mentions_parallel_lanes(monkeypatch) -> None:
     fake_st = _FakeStreamlit()
     monkeypatch.setattr(app, "st", fake_st)
     app.init_state(Settings.from_env())
@@ -252,10 +256,25 @@ def test_render_work_area_copy_only_mentions_provider_and_parallel_lanes(monkeyp
 
     assert observed["context_key"] == "primary"
     assert observed["title"] == "Upload PDF"
-    assert "change the provider and number of parallel lanes" in str(observed["copy"])
+    assert "change the number of parallel lanes" in str(observed["copy"])
+    assert "provider credentials" in str(observed["copy"])
+    assert "change the provider" not in str(observed["copy"])
     assert "page limit" not in str(observed["copy"])
     assert "retry timing" not in str(observed["copy"])
     assert "models" not in str(observed["copy"])
+
+
+def test_apply_runtime_settings_forces_openai_provider(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    fake_st.session_state["runtime_settings"] = app.build_runtime_settings_state(Settings.from_env())
+    fake_st.session_state["runtime_settings"]["llm_provider"] = "anthropic"
+    monkeypatch.setattr(app, "st", fake_st)
+
+    settings = app.apply_runtime_settings(Settings.from_env())
+
+    assert settings.llm_provider == "openai"
+    assert settings.model_ocr == "gpt-5.2"
+    assert fake_st.session_state["runtime_settings"]["llm_provider"] == "openai"
 
 
 def test_append_event_marks_finished_cooldown_once_timer_expires(monkeypatch) -> None:
