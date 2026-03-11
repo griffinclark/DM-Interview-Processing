@@ -102,6 +102,15 @@ LIVE_COUNTDOWN_BRIDGE_HTML = """
 """
 
 
+def render_html_block(markup: str) -> None:
+    # Streamlit markdown can coerce nested preview HTML into code blocks; use raw HTML when available.
+    html_renderer = getattr(st, "html", None)
+    if callable(html_renderer):
+        html_renderer(markup)
+        return
+    st.markdown(markup, unsafe_allow_html=True)
+
+
 def inject_styles() -> None:
     st.markdown(
         """
@@ -1540,6 +1549,7 @@ def inject_styles() -> None:
 
 
 def init_state(settings: Settings) -> None:
+    reset_run_scoped_widget_keys()
     st.session_state.setdefault("logs", [])
     st.session_state.setdefault("stage_progress", {stage.value: (0, 1) for stage in Stage})
     st.session_state.setdefault("active_stage", Stage.OCR.value)
@@ -1556,6 +1566,17 @@ def init_state(settings: Settings) -> None:
     runtime_settings = st.session_state.setdefault("runtime_settings", runtime_defaults)
     for key, value in runtime_defaults.items():
         runtime_settings.setdefault(key, value)
+
+
+def reset_run_scoped_widget_keys() -> None:
+    st.session_state["_render_key_counts"] = {}
+
+
+def run_scoped_widget_key(base_key: str) -> str:
+    key_counts = st.session_state.setdefault("_render_key_counts", {})
+    count = int(key_counts.get(base_key, 0)) + 1
+    key_counts[base_key] = count
+    return base_key if count == 1 else f"{base_key}__{count}"
 
 
 def build_ocr_pipeline_state(pipe_total: int = 3) -> dict:
@@ -1907,8 +1928,8 @@ def render_settings_dialog(base_settings: Settings) -> None:
         )
 
         save_col, reset_col = st.columns(2, gap="small")
-        save_clicked = save_col.form_submit_button("Save settings", use_container_width=True)
-        reset_clicked = reset_col.form_submit_button("Use defaults", use_container_width=True)
+        save_clicked = save_col.form_submit_button("Save settings", width="stretch")
+        reset_clicked = reset_col.form_submit_button("Use defaults", width="stretch")
 
     if reset_clicked:
         st.session_state["runtime_settings"] = defaults
@@ -1939,7 +1960,7 @@ def render_masthead() -> bool:
         )
     with action_col:
         st.markdown("<div style='height:0.25rem'></div>", unsafe_allow_html=True)
-        return st.button("Settings", key="open_run_settings", use_container_width=True)
+        return st.button("Settings", key="open_run_settings", width="stretch")
 
 
 def render_status(status_placeholder) -> None:
@@ -2377,7 +2398,7 @@ def render_ocr_parallel() -> None:
 
     rows_markup = "".join(rows)
 
-    st.markdown(
+    render_html_block(
         dedent(
             f"""
             <div class="section-card live-card">
@@ -2398,8 +2419,7 @@ def render_ocr_parallel() -> None:
                 <div class="ocr-grid">{rows_markup}</div>
             </div>
             """
-        ).strip(),
-        unsafe_allow_html=True,
+        ).strip()
     )
 
 
@@ -2558,6 +2578,9 @@ def render_upload_panel(
     copy: str | None = None,
     cache_path,
 ) -> tuple[object | None, str | None]:
+    upload_key = run_scoped_widget_key(f"pdf_upload_{context_key}")
+    run_key = run_scoped_widget_key(f"run_import_{context_key}")
+    cache_key = run_scoped_widget_key(f"run_from_cache_{context_key}")
     copy_markup = f'<div class="section-copy">{html.escape(copy)}</div>' if copy else ""
     st.markdown(
         f"""
@@ -2570,22 +2593,22 @@ def render_upload_panel(
     uploaded_file = st.file_uploader(
         "Planner PDF",
         type=["pdf"],
-        key=f"pdf_upload_{context_key}",
+        key=upload_key,
     )
     cache_available = cache_path.exists()
     run_col, cache_col = st.columns(2, gap="small")
     run_clicked = run_col.button(
         "Build workbook",
-        key=f"run_import_{context_key}",
+        key=run_key,
         type="primary",
-        use_container_width=True,
+        width="stretch",
         disabled=uploaded_file is None,
     )
     run_from_cache_clicked = cache_col.button(
         "Run from cache",
-        key=f"run_from_cache_{context_key}",
+        key=cache_key,
         type="secondary",
-        use_container_width=True,
+        width="stretch",
         disabled=not cache_available,
         help=(
             f"Use {cache_path.name} from the last completed document review."
@@ -2691,13 +2714,13 @@ def render_entry_question(result: ImportArtifacts) -> tuple[str | None, str | No
         submitted = submit_col.form_submit_button(
             "Submit answer and continue",
             type="primary",
-            use_container_width=True,
+            width="stretch",
         )
         delegated = delegate_col.form_submit_button(
             "Figure it out",
             type="secondary",
             help="Let the agent make the best supported choice from the document.",
-            use_container_width=True,
+            width="stretch",
         )
         st.markdown(
             '<div class="question-actions-note">Use <strong>Figure it out</strong> when you want the agent to make the call and keep moving.</div></div>',
@@ -2742,7 +2765,7 @@ def render_result(result: ImportArtifacts | None) -> None:
                 data=result.output_workbook_path.read_bytes(),
                 file_name=result.output_workbook_path.name,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+                width="stretch",
             )
     with report_col:
         st.download_button(
@@ -2750,7 +2773,7 @@ def render_result(result: ImportArtifacts | None) -> None:
             data=json.dumps(report.model_dump(mode="json"), indent=2),
             file_name=result.review_report_path.name if result.review_report_path else "review_report.json",
             mime="application/json",
-            use_container_width=True,
+            width="stretch",
         )
 
     if report.warnings:
@@ -2765,12 +2788,12 @@ def render_result(result: ImportArtifacts | None) -> None:
                     "sheet": assignment.sheet_name,
                     "cell": assignment.cell,
                     "semantic_key": assignment.semantic_key,
-                    "value": assignment.value,
-                    "comment": assignment.comment,
+                    "value": "" if assignment.value is None else str(assignment.value),
+                    "comment": assignment.comment or "",
                 }
                 for assignment in report.mapped_assignments
             ],
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -2795,13 +2818,13 @@ def render_work_area(work_placeholder, settings: Settings) -> tuple[object | Non
     with work_placeholder.container():
         if is_running:
             render_stage_focus()
-            return None, False, None
+            return None, None, None
 
         if result is not None and result.pending_question is not None and result.review_report is None:
             answer, source, submitted = render_entry_question(result)
             if submitted and answer is not None and source is not None:
                 resume_payload = (answer, source)
-            return None, False, resume_payload
+            return None, None, resume_payload
 
         if result is not None and result.review_report is not None:
             render_result(result)

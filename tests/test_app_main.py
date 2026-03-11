@@ -7,7 +7,16 @@ from types import SimpleNamespace
 import planlock.streamlit_app as app
 
 from planlock.config import Settings
-from planlock.models import AgentQuestion, QuestionOption, RunEvent, Severity, Stage
+from planlock.models import (
+    AgentQuestion,
+    CellAssignment,
+    QuestionOption,
+    ReviewReport,
+    RunEvent,
+    Severity,
+    Stage,
+    ValueKind,
+)
 
 
 class _Block:
@@ -52,6 +61,7 @@ class _FakeStreamlit:
         self.session_state = {}
         self.markdown_calls: list[str] = []
         self.empty_calls = 0
+        self.dataframe_rows = None
         self.radio_value = None
         self.selectbox_value = None
         self.text_input_value = ""
@@ -110,10 +120,33 @@ class _FakeStreamlit:
         lookup_key = key if key is not None else label
         return self.button_responses.get(lookup_key, False)
 
+    def expander(self, *args, **kwargs) -> _Block:
+        return _Block(self)
+
+    def download_button(self, *args, **kwargs) -> None:
+        return None
+
+    def dataframe(self, data, **kwargs) -> None:
+        self.dataframe_rows = data
+
+    def json(self, *args, **kwargs) -> None:
+        return None
+
     def error(self, *args, **kwargs) -> None:
         return None
 
     def rerun(self) -> None:
+        return None
+
+
+class _HtmlStreamlit(_FakeStreamlit):
+    def __init__(self) -> None:
+        super().__init__()
+        self.html_calls: list[str] = []
+
+    def html(self, *args, **kwargs) -> None:
+        if args:
+            self.html_calls.append(args[0])
         return None
 
 
@@ -275,6 +308,60 @@ def test_apply_runtime_settings_forces_openai_provider(monkeypatch) -> None:
     assert settings.llm_provider == "openai"
     assert settings.model_ocr == "gpt-5.2"
     assert fake_st.session_state["runtime_settings"]["llm_provider"] == "openai"
+
+
+def test_run_scoped_widget_key_suffixes_duplicate_widget_ids(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+
+    assert app.run_scoped_widget_key("pdf_upload_retry") == "pdf_upload_retry"
+    assert app.run_scoped_widget_key("pdf_upload_retry") == "pdf_upload_retry__2"
+    assert app.run_scoped_widget_key("pdf_upload_retry") == "pdf_upload_retry__3"
+
+
+def test_render_result_stringifies_mixed_assignment_values(monkeypatch, tmp_path: Path) -> None:
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+
+    workbook_path = tmp_path / "filled.xlsx"
+    workbook_path.write_bytes(b"workbook")
+
+    report = ReviewReport(
+        job_id="job-123",
+        template_sha256="template-sha",
+        success=True,
+        mapped_assignments=[
+            CellAssignment(
+                sheet_name="Data Input",
+                cell="B2",
+                semantic_key="profile.client_1.first_name",
+                value=42,
+                value_kind=ValueKind.NUMBER,
+            ),
+            CellAssignment(
+                sheet_name="Expenses",
+                cell="B10",
+                semantic_key="expense.travel.label",
+                value="Planner Import",
+                value_kind=ValueKind.STRING,
+            ),
+        ],
+    )
+
+    app.render_result(
+        app.ImportArtifacts(
+            success=True,
+            job_id="job-123",
+            job_dir=tmp_path,
+            output_workbook_path=workbook_path,
+            review_report=report,
+        )
+    )
+
+    assert fake_st.dataframe_rows is not None
+    assert fake_st.dataframe_rows[0]["value"] == "42"
+    assert fake_st.dataframe_rows[1]["value"] == "Planner Import"
 
 
 def test_append_event_marks_finished_cooldown_once_timer_expires(monkeypatch) -> None:
@@ -690,6 +777,30 @@ def test_render_ocr_parallel_renders_preview_as_background_image(monkeypatch) ->
     assert "background-image: url('data:image/png;base64,preview-image');" in markup
     assert 'role="img"' in markup
     assert "Page 5 in progress" in markup
+
+
+def test_render_ocr_parallel_prefers_raw_html_renderer_when_available(monkeypatch) -> None:
+    fake_st = _HtmlStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+
+    pipe = fake_st.session_state["ocr_pipeline"]["pipes"][0]
+    pipe["status"] = "running"
+    pipe["page_number"] = 5
+    pipe["started_at_ms"] = 1000
+    fake_st.session_state["ocr_pipeline"]["page_total"] = 23
+    fake_st.session_state["page_previews"] = {
+        5: "data:image/png;base64,preview-image",
+    }
+
+    monkeypatch.setattr(app.time, "time", lambda: 2.0)
+
+    app.render_ocr_parallel()
+
+    assert fake_st.markdown_calls == []
+    assert fake_st.html_calls
+    assert "ocr-preview-shell" in fake_st.html_calls[-1]
+    assert "background-image: url('data:image/png;base64,preview-image');" in fake_st.html_calls[-1]
 
 
 def test_reset_run_state_clears_lane_warnings_for_new_document(monkeypatch) -> None:
