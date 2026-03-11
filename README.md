@@ -1,10 +1,10 @@
 # PlanLock
 
-PlanLock is a locked workbook intake app for financial planners. It imports planner-facing PDF financial plans into the exact Excel workbook template shipped in this repository, enforces a no-drift structure policy, and exposes a three-stage pipeline:
+PlanLock is a locked workbook intake app for financial planners. It imports planner-facing PDF financial plans into the exact Excel workbook template shipped in this repository, enforces a no-drift structure policy, and exposes a two-step workflow:
 
 1. OCR
-2. Data Entry
-3. Financial Calculations
+2. Workbook Entry
+   LangGraph sheet entry and deterministic workbook validation share one UI surface.
 
 ## License
 
@@ -23,7 +23,7 @@ If you need commercial rights, you must secure a separate written license from t
 - Writes only to whitelisted workbook cells and repeating row blocks
 - Preserves formulas, styles, sheet order, named ranges, validations, and layout
 - Generates a sidecar `review_report.json` for planner review
-- Streams logs and three-stage progress in the Streamlit UI
+- Streams logs and two-step progress in the Streamlit UI
 
 ## Local Setup
 
@@ -42,14 +42,15 @@ Then update `.env` with your real API key. The app automatically loads `example.
 Required environment variables:
 
 ```bash
-ANTHROPIC_API_KEY="your-key"
+OPENAI_API_KEY="your-key"
 ```
 
 Runtime settings now live in the app’s `Settings` modal. The defaults are:
 
 ```bash
-MODEL_OCR="claude-sonnet-4-6"
-MODEL_MAPPING="claude-opus-4-6"
+LLM_PROVIDER="openai"
+OPENAI_MODEL="gpt-5.2"
+ANTHROPIC_MODEL="claude-sonnet-4-5-20250929"
 OCR_PARALLEL_WORKERS="3"
 LLM_TIMEOUT_SECONDS="120"
 LLM_MAX_RETRIES="2"
@@ -58,6 +59,8 @@ LLM_RETRY_MAX_SECONDS="12"
 MAX_PAGES="40"
 LOG_LEVEL="INFO"
 ```
+
+If you switch the runtime provider to `anthropic`, add `ANTHROPIC_API_KEY` to `.env`. Model choice is locked in code; the settings modal only exposes the provider.
 
 The locked template path and checksum stay in code and are not exposed in the settings modal.
 
@@ -75,9 +78,11 @@ Build and run:
 ```bash
 docker build -t planlock .
 docker run --rm -p 8501:8501 \
-  -e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" \
+  -e OPENAI_API_KEY="$OPENAI_API_KEY" \
   planlock
 ```
+
+To run with Anthropic instead, also pass `-e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"` and select `anthropic` in settings.
 
 The container includes LibreOffice so the app can attempt a headless recalculation pass during stage 3.
 
