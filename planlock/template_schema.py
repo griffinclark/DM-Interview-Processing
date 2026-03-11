@@ -135,6 +135,8 @@ EXPENSE_ROW_BLOCKS: dict[str, tuple[int, int]] = {
 
 
 DATA_INPUT_ACCOUNT_ROWS = list(range(18, 40))
+NET_WORTH_ASSET_ROWS = list(range(6, 19))
+NET_WORTH_LIABILITY_ROWS = list(range(22, 30))
 
 
 @dataclass(frozen=True)
@@ -197,6 +199,13 @@ ALLOWED_WRITE_CELLS_BY_SHEET.setdefault("Data Input", set()).update(
         f"{column}{row}"
         for row in DATA_INPUT_ACCOUNT_ROWS
         for column in ["B", "C", "D", "E", "F", "G", "H", "I", "J"]
+    }
+)
+ALLOWED_WRITE_CELLS_BY_SHEET.setdefault("Net Worth", set()).update(
+    {
+        f"{column}{row}"
+        for row in [*NET_WORTH_ASSET_ROWS, *NET_WORTH_LIABILITY_ROWS]
+        for column in ["B", "C"]
     }
 )
 
@@ -297,6 +306,17 @@ def sheet_reference_for_prompt(sheet_name: str) -> str:
             f"- {category}: rows {start_row}-{end_row}"
             for category, (start_row, end_row) in EXPENSE_ROW_BLOCKS.items()
         )
+    if sheet_name == "Net Worth":
+        lines.append("Net worth blocks:")
+        lines.append(
+            f"- Assets: write account labels to B{NET_WORTH_ASSET_ROWS[0]}:B{NET_WORTH_ASSET_ROWS[-1]} "
+            f"and balances to C{NET_WORTH_ASSET_ROWS[0]}:C{NET_WORTH_ASSET_ROWS[-1]}"
+        )
+        lines.append(
+            f"- Liabilities: write account labels to B{NET_WORTH_LIABILITY_ROWS[0]}:B{NET_WORTH_LIABILITY_ROWS[-1]} "
+            f"and balances to C{NET_WORTH_LIABILITY_ROWS[0]}:C{NET_WORTH_LIABILITY_ROWS[-1]}"
+        )
+        lines.append("- Use `accounts` candidates for this sheet and set `net_worth_section` when it is defensible.")
     if sheet_name == "Data Input":
         field_lines = [
             f"- {key} -> {cell}"

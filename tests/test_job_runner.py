@@ -429,7 +429,6 @@ def test_job_runner_traverses_template_in_sheet_order(tmp_path: Path) -> None:
     assert agent.sheet_calls == [
         "Data Input",
         "Net Worth",
-        "Transactions Raw",
         "Expenses",
         "Retirement Accounts",
         "Taxable Accounts",

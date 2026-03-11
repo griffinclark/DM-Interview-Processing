@@ -59,10 +59,20 @@ def transactions_query_schema_reference() -> str:
 
 def has_transaction_data(workbook_path: Path) -> bool:
     workbook = load_workbook(workbook_path, data_only=False, read_only=True)
-    if TRANSACTIONS_SHEET_NAME not in workbook.sheetnames:
+    try:
+        if TRANSACTIONS_SHEET_NAME not in workbook.sheetnames:
+            return False
+        sheet = workbook[TRANSACTIONS_SHEET_NAME]
+        populated_rows = 0
+        for values in sheet.iter_rows(min_row=1, max_col=len(_COLUMN_SPECS), values_only=True):
+            if not any(value not in (None, "") for value in values):
+                continue
+            populated_rows += 1
+            if populated_rows > 1:
+                return True
         return False
-    sheet = workbook[TRANSACTIONS_SHEET_NAME]
-    return sheet.max_row > 1
+    finally:
+        workbook.close()
 
 
 def _normalize_scalar(value: Any) -> Any:

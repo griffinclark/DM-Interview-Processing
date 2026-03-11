@@ -6,6 +6,7 @@ from openpyxl import load_workbook
 
 from planlock.config import Settings
 from planlock.models import (
+    AccountCandidate,
     CanonicalPlanDocument,
     ExpenseCandidate,
     FieldCandidate,
@@ -47,6 +48,30 @@ def test_build_assignments_and_preserve_formula_driven_fields(tmp_path: Path) ->
                 comment="Suggested monthly target from planner.",
             )
         ],
+        accounts=[
+            AccountCandidate(
+                net_worth_section="asset",
+                account_type="Savings",
+                owner_name="Joint",
+                account_identifier="xxxx1238",
+                institution="Ally Bank",
+                balance=15000.25,
+                monthly_contribution=300.0,
+                page_number=3,
+                source_excerpt="Ally Bank savings ending 1238 balance $15,000.25",
+                confidence=0.91,
+            ),
+            AccountCandidate(
+                net_worth_section="liability",
+                account_type="Mortgage",
+                owner_name="Joint",
+                institution="HomeLoanServ",
+                balance=402500.10,
+                page_number=4,
+                source_excerpt="Mortgage principal balance $402,500.10",
+                confidence=0.89,
+            ),
+        ],
         holdings=[
             HoldingCandidate(
                 sheet_name="Taxable Accounts",
@@ -70,6 +95,14 @@ def test_build_assignments_and_preserve_formula_driven_fields(tmp_path: Path) ->
 
     workbook = load_workbook(workbook_path)
     assert workbook["Data Input"]["C6"].value == "Taylor"
+    assert workbook["Data Input"]["B18"].value == "Savings"
+    assert workbook["Data Input"]["G18"].value == 15000.25
+    assert workbook["Data Input"]["B19"].value == "Mortgage"
+    assert workbook["Data Input"]["G19"].value == 402500.10
+    assert workbook["Net Worth"]["B6"].value == "Ally Bank - Savings - Joint - xxxx1238"
+    assert workbook["Net Worth"]["C6"].value == 15000.25
+    assert workbook["Net Worth"]["B22"].value == "HomeLoanServ - Mortgage - Joint"
+    assert workbook["Net Worth"]["C22"].value == 402500.10
     assert workbook["Expenses"]["D55"].value == 1250.0
     assert workbook["Expenses"]["C55"].value == '=IF(D55="","",D55*12)'
     assert workbook["Taxable Accounts"]["B6"].value == "Brokerage"

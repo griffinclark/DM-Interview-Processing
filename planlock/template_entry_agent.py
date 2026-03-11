@@ -33,6 +33,7 @@ from planlock.models import (
 )
 from planlock.template_schema import (
     ALLOWED_WRITE_CELLS_BY_SHEET,
+    EXPENSE_ROW_BLOCKS,
     TEMPLATE_SHEET_ORDER,
     sheet_reference_for_prompt,
 )
@@ -50,6 +51,7 @@ Rules:
 - Only emit candidates for the active workbook sheet.
 - You may inspect the full OCR corpus for context, but only map values supported by the active sheet schema.
 - If a ledger query tool is available, use it before asking the user to manually inspect or total transaction rows.
+- For Net Worth, use `accounts` candidates and set `net_worth_section` to `asset` or `liability` whenever the document supports that distinction.
 - Ask a user question only when a material ambiguity blocks a supported target on the active sheet.
 - If the user explicitly delegates a decision back to you, choose the most defensible supported value from the available evidence and do not ask the same question again unless the sheet still cannot proceed safely.
 - Emit literal values only for directly observed constants or user-provided answers.
@@ -145,12 +147,94 @@ def read_sheet_context(
     return "\n".join(lines)
 
 
+def read_sheet_scaffold_context(workbook_path: Path, sheet_name: str) -> str | None:
+    if sheet_name != "Expenses":
+        return None
+
+    workbook = load_workbook(workbook_path, data_only=False)
+    sheet = workbook[sheet_name]
+    lines = [
+        "Locked template scaffold for Expenses (read-only reference cells, including headers and subtotal rows):"
+    ]
+
+    for row_number in range(1, 72):
+        populated_cells: list[str] = []
+        for column_letter in ["A", "B", "C", "D", "E", "F", "G"]:
+            value = sheet[f"{column_letter}{row_number}"].value
+            if value in (None, ""):
+                continue
+            populated_cells.append(f"{column_letter}{row_number} = {value}")
+        if populated_cells:
+            lines.append(f"- row {row_number}: " + ", ".join(populated_cells))
+
+    if all(sheet[f"A{row_number}"].value in (None, "") for row_number in range(6, 71)):
+        lines.append("- Column A starter rows 6-70 are blank in the locked template.")
+
+    if len(lines) == 1:
+        lines.append("- No scaffold reference cells detected.")
+
+    return "\n".join(lines)
+
+
 def _stringify_workbook_value(value: object) -> str:
     if isinstance(value, datetime):
         return value.isoformat(sep=" ")
     if isinstance(value, date):
         return value.isoformat()
     return str(value)
+
+
+def _is_formula_like_workbook_value(value: object) -> bool:
+    return isinstance(value, str) and value.startswith("=")
+
+
+def _find_preloaded_table(
+    workbook_path: Path,
+    sheet_name: str,
+    *,
+    max_row_gap: int = 3,
+) -> tuple[int, list[tuple[int, str]], list[tuple[int, list[object]]]] | None:
+    workbook = load_workbook(workbook_path, data_only=False, read_only=True)
+    try:
+        sheet = workbook[sheet_name]
+        populated_rows: list[tuple[int, list[object]]] = []
+        for row_number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+            row_values = list(row)
+            if any(value not in (None, "") for value in row_values):
+                populated_rows.append((row_number, row_values))
+
+        for index, (row_number, row_values) in enumerate(populated_rows):
+            header_pairs: list[tuple[int, str]] = []
+            for column_index, value in enumerate(row_values):
+                if value in (None, "") or _is_formula_like_workbook_value(value):
+                    continue
+                header = _stringify_workbook_value(value).strip()
+                if header:
+                    header_pairs.append((column_index, header))
+            if len(header_pairs) < 2:
+                continue
+
+            data_rows: list[tuple[int, list[object]]] = []
+            previous_row_number = row_number
+            for candidate_row_number, candidate_row_values in populated_rows[index + 1 :]:
+                if candidate_row_number - previous_row_number > max_row_gap:
+                    break
+
+                literal_count = sum(
+                    1
+                    for value in candidate_row_values
+                    if value not in (None, "") and not _is_formula_like_workbook_value(value)
+                )
+                if literal_count >= 2:
+                    data_rows.append((candidate_row_number, candidate_row_values))
+                    previous_row_number = candidate_row_number
+
+            if data_rows:
+                return row_number, header_pairs, data_rows
+
+        return None
+    finally:
+        workbook.close()
 
 
 def read_preloaded_template_context(
@@ -169,27 +253,15 @@ def read_preloaded_template_context(
         if ALLOWED_WRITE_CELLS_BY_SHEET.get(sheet_name):
             continue
 
-        sheet = workbook[sheet_name]
-        populated_rows: list[tuple[int, list[object]]] = []
-        for row_number, row in enumerate(sheet.iter_rows(values_only=True), start=1):
-            if any(value not in (None, "") for value in row):
-                populated_rows.append((row_number, list(row)))
-
-        if not populated_rows:
+        preloaded_table = _find_preloaded_table(workbook_path, sheet_name)
+        if preloaded_table is None:
             continue
 
-        header_row_number, header_values = populated_rows[0]
-        header_pairs: list[tuple[int, str]] = []
-        for index, value in enumerate(header_values):
-            if value in (None, ""):
-                continue
-            header = _stringify_workbook_value(value).strip()
-            if header:
-                header_pairs.append((index, header))
+        header_row_number, header_pairs, data_rows = preloaded_table
         headers = [header for _, header in header_pairs]
 
         sample_rows: list[dict[str, object]] = []
-        for row_number, row_values in populated_rows[1 : sample_row_limit + 1]:
+        for row_number, row_values in data_rows[:sample_row_limit]:
             record: dict[str, str] = {}
             for index, header in header_pairs:
                 if index >= len(row_values):
@@ -207,7 +279,7 @@ def read_preloaded_template_context(
                 "template_data_present": True,
                 "header_row_number": header_row_number,
                 "header_columns": headers,
-                "data_row_count": max(0, len(populated_rows) - 1),
+                "data_row_count": len(data_rows),
                 "sample_rows": sample_rows,
                 "note": (
                     "This sheet already contains starter data from the locked template before any "
@@ -221,12 +293,9 @@ def read_preloaded_template_context(
 
 
 def sheet_has_preloaded_template_data(workbook_path: Path, sheet_name: str) -> bool:
-    workbook = load_workbook(workbook_path, data_only=False)
-    sheet = workbook[sheet_name]
-    for row in sheet.iter_rows(values_only=True):
-        if any(value not in (None, "") for value in row):
-            return True
-    return False
+    if sheet_name == TRANSACTIONS_SHEET_NAME:
+        return has_transaction_data(workbook_path)
+    return _find_preloaded_table(workbook_path, sheet_name) is not None
 
 
 def sheet_has_populated_writable_cells(workbook_path: Path, sheet_name: str) -> bool:
@@ -247,6 +316,30 @@ def prioritize_data_input_sheet(sheet_order: list[str]) -> list[str]:
 
 def touched_cells_for_assignments(assignments: list[CellAssignment], sheet_name: str) -> list[str]:
     return [assignment.cell for assignment in assignments if assignment.sheet_name == sheet_name]
+
+
+def sheet_specific_prompt_guidance(sheet_name: str) -> str:
+    if sheet_name == "Net Worth":
+        return (
+            "Net-Worth-specific guidance:\n"
+            "- Use `accounts` candidates for the Family Balance Sheet rows.\n"
+            "- Set `net_worth_section` to `asset` or `liability` whenever the document supports that distinction.\n"
+            "- Write liability balances as positive outstanding amounts; the sheet subtracts liabilities in its formulas.\n"
+            "- Keep account labels concise enough for column B while preserving institution, account type, and owner when useful.\n"
+        )
+
+    if sheet_name != "Expenses":
+        return ""
+
+    supported_categories = ", ".join(EXPENSE_ROW_BLOCKS)
+    return (
+        "Expenses-specific guidance:\n"
+        "- Treat Expenses as a block-based summary sheet, not a fully pre-labeled line-item ledger.\n"
+        f"- Supported expense categories are exactly: {supported_categories}.\n"
+        "- Return at most one expense candidate per supported category block.\n"
+        "- Aggregate granular Transactions Raw categories into the closest supported expense block and explain judgment calls in the candidate comment.\n"
+        "- Do not ask the user to paste, screenshot, or transcribe labels from the active Expenses sheet. The workbook scaffold above is the source of truth for this tab.\n"
+    )
 
 
 def coverage_summary_for_state(state: EntrySessionState) -> CoverageSummary:
@@ -411,6 +504,64 @@ class LangGraphTemplateEntryAgent:
             "raw-PDF fallback is needed."
         )
 
+    @staticmethod
+    def _latest_answers_for_sheet(
+        session_state: EntrySessionState,
+        *,
+        sheet_name: str,
+        sources: set[str],
+    ) -> list[AgentAnswer]:
+        latest_answers: list[AgentAnswer] = []
+        seen_question_ids: set[str] = set()
+        for answer in reversed(session_state.user_answers):
+            if answer.sheet_name != sheet_name or answer.source not in sources:
+                continue
+            if answer.question_id in seen_question_ids:
+                continue
+            seen_question_ids.add(answer.question_id)
+            latest_answers.append(answer)
+        latest_answers.reverse()
+        return latest_answers
+
+    @staticmethod
+    def _resume_mode_label(
+        session_state: EntrySessionState,
+        *,
+        sheet_name: str,
+    ) -> str:
+        if any(answer.sheet_name == sheet_name for answer in session_state.user_answers):
+            return "resumed after retaining a planner or agent answer"
+        if any(summary.sheet_name == sheet_name for summary in session_state.sheet_summaries):
+            return "rerunning with prior workbook writes preserved"
+        return "fresh sheet pass"
+
+    def _workflow_step_context(
+        self,
+        *,
+        session_state: EntrySessionState,
+        sheet_name: str,
+    ) -> str:
+        total_sheets = len(session_state.sheet_order)
+        current_step_number = min(session_state.current_sheet_index + 1, total_sheets) if total_sheets else 0
+        completed_sheets = [
+            summary.sheet_name
+            for summary in session_state.sheet_summaries
+            if summary.status == "completed"
+        ]
+        remaining_sheets = session_state.sheet_order[session_state.current_sheet_index + 1 :]
+        completed_label = ", ".join(completed_sheets) if completed_sheets else "none"
+        remaining_label = ", ".join(remaining_sheets) if remaining_sheets else "none"
+        return (
+            "Workflow step context:\n"
+            f"- Step index: {current_step_number} of {total_sheets}\n"
+            f"- Active sheet: {sheet_name}\n"
+            f"- Resume mode: {self._resume_mode_label(session_state, sheet_name=sheet_name)}\n"
+            f"- Completed sheets so far: {completed_label}\n"
+            f"- Remaining sheets after this pass: {remaining_label}\n"
+            "- Prior transcript messages are intentionally dropped between passes. "
+            "Use only the retained decision state below."
+        )
+
     def _data_input_context(
         self,
         *,
@@ -454,13 +605,19 @@ class LangGraphTemplateEntryAgent:
     ) -> str:
         explicit_answers_payload = [
             answer.model_dump(mode="json")
-            for answer in session_state.user_answers
-            if answer.sheet_name == sheet_name and answer.source in {"option", "free_text"}
+            for answer in self._latest_answers_for_sheet(
+                session_state,
+                sheet_name=sheet_name,
+                sources={"option", "free_text"},
+            )
         ]
         agent_answers_payload = [
             answer.model_dump(mode="json")
-            for answer in session_state.user_answers
-            if answer.sheet_name == sheet_name and answer.source in {"agent", "raw_pdf_review"}
+            for answer in self._latest_answers_for_sheet(
+                session_state,
+                sheet_name=sheet_name,
+                sources={"agent", "raw_pdf_review"},
+            )
         ]
         prior_assignments = [
             assignment.model_dump(mode="json")
@@ -472,6 +629,7 @@ class LangGraphTemplateEntryAgent:
             sheet_name,
             touched_cells=touched_cells_for_assignments(session_state.mapped_assignments, sheet_name),
         )
+        scaffold_context = read_sheet_scaffold_context(session_state.workbook_path, sheet_name)
         data_input_context = self._data_input_context(
             session_state=session_state,
             sheet_name=sheet_name,
@@ -485,6 +643,9 @@ class LangGraphTemplateEntryAgent:
         data_input_block = ""
         if data_input_context is not None:
             data_input_block = f"Populated Data Input sheet context already written into the workbook:\n{data_input_context}\n\n"
+        scaffold_block = ""
+        if scaffold_context is not None:
+            scaffold_block = f"{scaffold_context}\n\n"
         transactions_tool_block = ""
         if transactions_tool_available:
             transactions_tool_block = (
@@ -503,18 +664,21 @@ class LangGraphTemplateEntryAgent:
             )
         return (
             f"Active workbook sheet: {sheet_name}\n\n"
+            f"{self._workflow_step_context(session_state=session_state, sheet_name=sheet_name)}\n\n"
             f"{self._context_stage_instructions(context_stage)}\n\n"
             f"{sheet_reference_for_prompt(sheet_name)}\n\n"
+            f"{sheet_specific_prompt_guidance(sheet_name)}\n"
             f"{workbook_context}\n\n"
+            f"{scaffold_block}"
             f"{data_input_block}"
             f"{transactions_tool_block}"
             "Preloaded template data already present in this workbook before any agent writes:\n"
             f"{json.dumps(preloaded_template_context, indent=2)}\n\n"
-            "Confirmed user answers for this sheet:\n"
+            "Retained planner answers for this sheet:\n"
             f"{json.dumps(explicit_answers_payload, indent=2)}\n\n"
-            "Agent-sourced decisions for this sheet:\n"
+            "Retained agent decisions for this sheet:\n"
             f"{json.dumps(agent_answers_payload, indent=2)}\n\n"
-            "Agent-sourced decisions can come from a prior raw PDF re-review or an explicit user delegation. If they are present, resolve those targets yourself and avoid asking the same question again unless the sheet still cannot proceed safely.\n\n"
+            "Retained decisions are the only run-to-run memory carried into this pass. Agent-sourced decisions can come from a prior raw PDF re-review or an explicit user delegation. If they are present, resolve those targets yourself and avoid asking the same question again unless the sheet still cannot proceed safely.\n\n"
             "Prior mapped assignments already written for this sheet:\n"
             f"{json.dumps(prior_assignments, indent=2)}\n\n"
             f"{ocr_block}"
@@ -530,14 +694,18 @@ class LangGraphTemplateEntryAgent:
     ) -> str:
         explicit_answers_payload = [
             answer.model_dump(mode="json")
-            for answer in session_state.user_answers
-            if answer.sheet_name == sheet_name and answer.source in {"option", "free_text"}
+            for answer in self._latest_answers_for_sheet(
+                session_state,
+                sheet_name=sheet_name,
+                sources={"option", "free_text"},
+            )
         ]
         workbook_context = read_sheet_context(
             session_state.workbook_path,
             sheet_name,
             touched_cells=touched_cells_for_assignments(session_state.mapped_assignments, sheet_name),
         )
+        scaffold_context = read_sheet_scaffold_context(session_state.workbook_path, sheet_name)
         data_input_context = self._data_input_context(
             session_state=session_state,
             sheet_name=sheet_name,
@@ -554,12 +722,18 @@ class LangGraphTemplateEntryAgent:
         data_input_block = ""
         if data_input_context is not None:
             data_input_block = f"Populated Data Input sheet context already written into the workbook:\n{data_input_context}\n\n"
+        scaffold_block = ""
+        if scaffold_context is not None:
+            scaffold_block = f"{scaffold_context}\n\n"
         return (
             f"Active workbook sheet: {sheet_name}\n\n"
+            f"{self._workflow_step_context(session_state=session_state, sheet_name=sheet_name)}\n\n"
             "Context stage: raw_pdf_review\n"
             "This is the final fallback. Use workbook context first, then the raw OCR text below only to answer the pending question.\n\n"
             f"{sheet_reference_for_prompt(sheet_name)}\n\n"
+            f"{sheet_specific_prompt_guidance(sheet_name)}\n"
             f"{workbook_context}\n\n"
+            f"{scaffold_block}"
             f"{data_input_block}"
             "Preloaded template data already present in this workbook before any agent writes:\n"
             f"{json.dumps(preloaded_template_context, indent=2)}\n\n"
@@ -837,7 +1011,9 @@ class LangGraphTemplateEntryAgent:
 
 
 def default_sheet_order() -> list[str]:
-    return prioritize_data_input_sheet(list(TEMPLATE_SHEET_ORDER))
+    return prioritize_data_input_sheet(
+        [sheet_name for sheet_name in TEMPLATE_SHEET_ORDER if sheet_name != TRANSACTIONS_SHEET_NAME]
+    )
 
 
 def answer_from_question(

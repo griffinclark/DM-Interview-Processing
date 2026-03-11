@@ -13,6 +13,7 @@ from openpyxl.utils.datetime import to_excel
 
 from planlock.config import Settings
 from planlock.models import (
+    AccountCandidate,
     CanonicalPlanDocument,
     CellAssignment,
     ImportWarning,
@@ -25,6 +26,8 @@ from planlock.template_schema import (
     EDUCATION_BLOCKS,
     EXPENSE_ROW_BLOCKS,
     FIELD_TARGETS,
+    NET_WORTH_ASSET_ROWS,
+    NET_WORTH_LIABILITY_ROWS,
     PORTFOLIO_BLOCKS,
     RETIREMENT_BLOCKS,
     TAXABLE_BLOCKS,
@@ -38,6 +41,17 @@ REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 ET.register_namespace("", SPREADSHEET_NS)
 ET.register_namespace("r", REL_NS)
+
+
+LIABILITY_ACCOUNT_HINTS = (
+    "credit",
+    "debt",
+    "heloc",
+    "liability",
+    "loan",
+    "mortgage",
+    "payable",
+)
 
 
 def copy_locked_template(settings: Settings, job_dir: Path) -> Path:
@@ -267,6 +281,58 @@ def _expense_assignments(document: CanonicalPlanDocument) -> list[CellAssignment
     return assignments
 
 
+def _clean_account_text(value: str | None) -> str | None:
+    cleaned = (value or "").strip()
+    return cleaned or None
+
+
+def _net_worth_section_for_account(account: AccountCandidate) -> str:
+    if account.net_worth_section in {"asset", "liability"}:
+        return account.net_worth_section
+    if isinstance(account.balance, (int, float)) and account.balance < 0:
+        return "liability"
+
+    text_parts = [
+        account.account_type,
+        account.owner_name,
+        account.account_identifier,
+        account.institution,
+        account.notes,
+        account.source_excerpt,
+    ]
+    normalized = " ".join(part.strip().lower() for part in text_parts if isinstance(part, str) and part.strip())
+    if any(keyword in normalized for keyword in LIABILITY_ACCOUNT_HINTS):
+        return "liability"
+    return "asset"
+
+
+def _net_worth_label_for_account(account: AccountCandidate) -> str:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for raw_value in [
+        account.institution,
+        account.account_type,
+        account.owner_name,
+        account.account_identifier,
+    ]:
+        cleaned = _clean_account_text(raw_value)
+        if cleaned is None:
+            continue
+        signature = cleaned.casefold()
+        if signature in seen:
+            continue
+        seen.add(signature)
+        parts.append(cleaned)
+
+    if parts:
+        return " - ".join(parts)
+
+    fallback = _clean_account_text(account.notes) or _clean_account_text(account.source_excerpt)
+    if fallback is not None:
+        return fallback
+    return "Imported account"
+
+
 def _account_assignments(document: CanonicalPlanDocument) -> tuple[list[CellAssignment], list[ImportWarning]]:
     assignments: list[CellAssignment] = []
     warnings: list[ImportWarning] = []
@@ -298,11 +364,65 @@ def _account_assignments(document: CanonicalPlanDocument) -> tuple[list[CellAssi
                 )
             )
 
+    net_worth_row_index = {"asset": 0, "liability": 0}
+    net_worth_overflow: set[str] = set()
+    net_worth_rows_by_section = {
+        "asset": NET_WORTH_ASSET_ROWS,
+        "liability": NET_WORTH_LIABILITY_ROWS,
+    }
+    for account in document.accounts:
+        if account.balance is None:
+            continue
+
+        section = _net_worth_section_for_account(account)
+        rows = net_worth_rows_by_section[section]
+        row_index = net_worth_row_index[section]
+        if row_index >= len(rows):
+            net_worth_overflow.add(section)
+            continue
+
+        row = rows[row_index]
+        net_worth_row_index[section] += 1
+        source_pages = [account.page_number] if account.page_number else []
+        balance = abs(account.balance) if section == "liability" else account.balance
+        label = _net_worth_label_for_account(account)
+        assignments.extend(
+            [
+                CellAssignment(
+                    sheet_name="Net Worth",
+                    cell=f"B{row}",
+                    value=label,
+                    value_kind=ValueKind.STRING,
+                    semantic_key=f"net_worth.{section}.{row}.label",
+                    source_pages=source_pages,
+                    comment=account.notes,
+                ),
+                CellAssignment(
+                    sheet_name="Net Worth",
+                    cell=f"C{row}",
+                    value=balance,
+                    value_kind=ValueKind.NUMBER,
+                    semantic_key=f"net_worth.{section}.{row}.balance",
+                    source_pages=source_pages,
+                    comment=account.notes,
+                ),
+            ]
+        )
+
     if len(document.accounts) > len(DATA_INPUT_ACCOUNT_ROWS):
         warnings.append(
             ImportWarning(
                 code="account_capacity_exceeded",
                 message="Not all net-worth accounts fit into the locked workbook rows.",
+                severity=Severity.WARNING,
+                stage=Stage.DATA_ENTRY,
+            )
+        )
+    for section in sorted(net_worth_overflow):
+        warnings.append(
+            ImportWarning(
+                code="net_worth_capacity_exceeded",
+                message=f"Not all {section} accounts fit into the Net Worth sheet.",
                 severity=Severity.WARNING,
                 stage=Stage.DATA_ENTRY,
             )

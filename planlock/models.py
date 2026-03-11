@@ -78,6 +78,7 @@ class ExpenseCandidate(BaseModel):
 
 
 class AccountCandidate(BaseModel):
+    net_worth_section: Literal["asset", "liability"] | None = None
     account_type: str | None = None
     owner_name: str | None = None
     account_identifier: str | None = None

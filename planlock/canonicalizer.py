@@ -112,6 +112,7 @@ def merge_page_mappings(page_results: list[PageMappingResult]) -> tuple[Canonica
 
         for account in result.accounts:
             dedupe_key = (
+                account.net_worth_section,
                 account.account_type,
                 account.owner_name,
                 account.account_identifier,
@@ -120,6 +121,7 @@ def merge_page_mappings(page_results: list[PageMappingResult]) -> tuple[Canonica
             )
             if dedupe_key not in {
                 (
+                    existing.net_worth_section,
                     existing.account_type,
                     existing.owner_name,
                     existing.account_identifier,

@@ -147,7 +147,36 @@ def test_render_entry_question_shows_raw_pdf_rereview_chip(monkeypatch, tmp_path
     assert "Last write summary" not in markup
 
 
-def test_render_entry_question_prefers_html_renderer_with_compact_modal_markup(
+def test_render_entry_question_places_live_prompt_before_workbook_stage(monkeypatch, tmp_path: Path) -> None:
+    fake_st = _QuestionStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.setattr(app, "render_workbook_stage", lambda: fake_st.markdown_calls.append("WORKBOOK_STAGE"))
+
+    result = ImportArtifacts(
+        success=False,
+        job_id="job-123",
+        job_dir=tmp_path,
+        entry_state_path=None,
+        pending_question=AgentQuestion(
+            id="income-cadence",
+            sheet_name="Data Input",
+            prompt="Should the income values use monthly or annual amounts?",
+            rationale="The source document is ambiguous.",
+            affected_targets=["income.client_1.base_salary_gross"],
+        ),
+    )
+
+    answer, source, submitted = app.render_entry_question(result)
+
+    assert (answer, source, submitted) == (None, None, False)
+    question_index = next(
+        index for index, call in enumerate(fake_st.markdown_calls) if "Planner decision required" in call
+    )
+    stage_index = fake_st.markdown_calls.index("WORKBOOK_STAGE")
+    assert question_index < stage_index
+
+
+def test_render_entry_question_prefers_html_renderer_with_inline_markup(
     monkeypatch, tmp_path: Path
 ) -> None:
     fake_st = _QuestionHtmlStreamlit()
@@ -168,20 +197,22 @@ def test_render_entry_question_prefers_html_renderer_with_compact_modal_markup(
         ),
     )
 
-    app.render_entry_question_form(result, {"progress_text": "0/7 completed • 7 remaining"}, modal=True)
+    app.render_entry_question_form(result, {"progress_text": "0/7 completed • 7 remaining"})
 
     assert fake_st.html_calls
     markup = fake_st.html_calls[-1]
+    assert 'class="question-shell is-inline is-live"' in markup
     assert 'class="question-panel"' in markup
     assert "Planner decision required" in markup
     assert "Data Input" in markup
     assert "0/7 completed • 7 remaining" in markup
+    assert "Choose the best supported answer below" in markup
     assert "Affected targets" not in markup
     assert "Last write summary" not in markup
     assert "Current sheet" not in markup
 
 
-def test_render_entry_question_form_clears_modal_inputs_between_questions(monkeypatch, tmp_path: Path) -> None:
+def test_render_entry_question_form_clears_inline_inputs_between_questions(monkeypatch, tmp_path: Path) -> None:
     fake_st = _StatefulQuestionStreamlit()
     monkeypatch.setattr(app, "st", fake_st)
 
@@ -208,7 +239,7 @@ def test_render_entry_question_form_clears_modal_inputs_between_questions(monkey
         ),
     )
 
-    app.render_entry_question_form(result, {"progress_text": "0/7 completed • 7 remaining"}, modal=True)
+    app.render_entry_question_form(result, {"progress_text": "0/7 completed • 7 remaining"})
 
     current_widget_keys = app.entry_question_widget_keys("job-123", "income-cadence")
     assert fake_st.session_state[app.QUESTION_WIDGET_STATE_KEY]["job-123"] == app.entry_question_signature(
@@ -220,7 +251,7 @@ def test_render_entry_question_form_clears_modal_inputs_between_questions(monkey
     assert fake_st.text_input_calls[-1]["value"] == ""
 
 
-def test_render_entry_question_modal_submit_queues_answer_and_forces_app_rerun(
+def test_render_entry_question_inline_submit_queues_answer_and_forces_app_rerun(
     monkeypatch, tmp_path: Path
 ) -> None:
     fake_st = _SubmittingQuestionStreamlit({"Submit answer and continue": True})
@@ -244,9 +275,7 @@ def test_render_entry_question_modal_submit_queues_answer_and_forces_app_rerun(
         ),
     )
 
-    answer, source, submitted = app.render_entry_question_form(
-        result, {"progress_text": "0/7 completed • 7 remaining"}, modal=True
-    )
+    answer, source, submitted = app.render_entry_question_form(result, {"progress_text": "0/7 completed • 7 remaining"})
 
     assert (answer, source, submitted) == (None, None, False)
     assert fake_st.session_state[app.QUESTION_SUBMISSION_STATE_KEY] == {
@@ -255,10 +284,18 @@ def test_render_entry_question_modal_submit_queues_answer_and_forces_app_rerun(
         "answer": "monthly",
         "source": "option",
     }
+    assert fake_st.session_state[app.QUESTION_TRANSITION_STATE_KEY] == {
+        "job_id": "job-123",
+        "question_signature": app.entry_question_signature(result.pending_question),
+        "sheet_name": "Data Input",
+        "prompt": "Should the income values use monthly or annual amounts?",
+        "progress_text": "0/7 completed • 7 remaining",
+        "pdf_rereviewed": False,
+    }
     assert fake_st.rerun_calls == [{"scope": "app"}]
 
 
-def test_render_entry_question_modal_delegate_queues_agent_choice_and_forces_app_rerun(
+def test_render_entry_question_inline_delegate_queues_agent_choice_and_forces_app_rerun(
     monkeypatch, tmp_path: Path
 ) -> None:
     fake_st = _SubmittingQuestionStreamlit({"Figure it out": True})
@@ -282,9 +319,7 @@ def test_render_entry_question_modal_delegate_queues_agent_choice_and_forces_app
         ),
     )
 
-    answer, source, submitted = app.render_entry_question_form(
-        result, {"progress_text": "0/7 completed • 7 remaining"}, modal=True
-    )
+    answer, source, submitted = app.render_entry_question_form(result, {"progress_text": "0/7 completed • 7 remaining"})
 
     assert (answer, source, submitted) == (None, None, False)
     assert fake_st.session_state[app.QUESTION_SUBMISSION_STATE_KEY] == {
@@ -294,6 +329,72 @@ def test_render_entry_question_modal_delegate_queues_agent_choice_and_forces_app
         "source": "agent",
     }
     assert fake_st.rerun_calls == [{"scope": "app"}]
+
+
+def test_render_entry_question_handoff_renders_exit_markup_once(monkeypatch) -> None:
+    fake_st = _QuestionHtmlStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    fake_st.session_state[app.QUESTION_TRANSITION_STATE_KEY] = {
+        "job_id": "job-123",
+        "question_signature": "question-signature",
+        "sheet_name": "Expenses",
+        "prompt": "Please provide the monthly totals by expense line item.",
+        "progress_text": "2/7 completed • 5 remaining",
+        "pdf_rereviewed": True,
+    }
+
+    app.render_entry_question_handoff(job_id="job-123", clear_after_render=True)
+
+    assert fake_st.html_calls
+    markup = fake_st.html_calls[-1]
+    assert 'class="question-shell is-inline is-exiting"' in markup
+    assert "Answer logged" in markup
+    assert "Workbook entry is resuming for this section now." in markup
+    assert fake_st.session_state[app.QUESTION_TRANSITION_STATE_KEY] is None
+
+
+def test_render_entry_question_places_handoff_before_workbook_stage(monkeypatch, tmp_path: Path) -> None:
+    fake_st = _QuestionStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    monkeypatch.setattr(app, "render_workbook_stage", lambda: fake_st.markdown_calls.append("WORKBOOK_STAGE"))
+
+    question = AgentQuestion(
+        id="income-cadence",
+        sheet_name="Data Input",
+        prompt="Should the income values use monthly or annual amounts?",
+        rationale="The source document is ambiguous.",
+        affected_targets=["income.client_1.base_salary_gross"],
+    )
+    question_signature = app.entry_question_signature(question)
+    fake_st.session_state[app.QUESTION_SUBMISSION_STATE_KEY] = {
+        "job_id": "job-123",
+        "question_signature": question_signature,
+        "answer": "",
+        "source": "agent",
+    }
+    fake_st.session_state[app.QUESTION_TRANSITION_STATE_KEY] = {
+        "job_id": "job-123",
+        "question_signature": question_signature,
+        "sheet_name": question.sheet_name,
+        "prompt": question.prompt,
+        "progress_text": "0/7 completed • 7 remaining",
+        "pdf_rereviewed": False,
+    }
+
+    answer, source, submitted = app.render_entry_question(
+        ImportArtifacts(
+            success=False,
+            job_id="job-123",
+            job_dir=tmp_path,
+            entry_state_path=None,
+            pending_question=question,
+        )
+    )
+
+    assert (answer, source, submitted) == ("", "agent", True)
+    question_index = next(index for index, call in enumerate(fake_st.markdown_calls) if "Answer logged" in call)
+    stage_index = fake_st.markdown_calls.index("WORKBOOK_STAGE")
+    assert question_index < stage_index
 
 
 def test_render_entry_question_ignores_submission_from_prior_question(monkeypatch, tmp_path: Path) -> None:
@@ -314,6 +415,14 @@ def test_render_entry_question_ignores_submission_from_prior_question(monkeypatc
         "answer": "Legacy answer",
         "source": "free_text",
     }
+    fake_st.session_state[app.QUESTION_TRANSITION_STATE_KEY] = {
+        "job_id": "job-123",
+        "question_signature": app.entry_question_signature(prior_question),
+        "sheet_name": "Data Input",
+        "prompt": "Use monthly amounts?",
+        "progress_text": "0/7 completed • 7 remaining",
+        "pdf_rereviewed": False,
+    }
 
     result = ImportArtifacts(
         success=False,
@@ -333,3 +442,4 @@ def test_render_entry_question_ignores_submission_from_prior_question(monkeypatc
 
     assert (answer, source, submitted) == (None, None, False)
     assert app.QUESTION_SUBMISSION_STATE_KEY not in fake_st.session_state
+    assert fake_st.session_state[app.QUESTION_TRANSITION_STATE_KEY] is None

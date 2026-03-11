@@ -516,6 +516,46 @@ def test_render_work_area_copy_only_mentions_parallel_lanes(monkeypatch) -> None
     assert "models" not in str(observed["copy"])
 
 
+def test_render_work_area_places_question_handoff_before_stage_focus(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["is_running"] = True
+    fake_st.session_state[app.QUESTION_TRANSITION_STATE_KEY] = {
+        "job_id": "job-123",
+        "question_signature": "question-signature",
+        "sheet_name": "Expenses",
+        "prompt": "Please provide the monthly totals by expense line item.",
+        "progress_text": "2/7 completed • 5 remaining",
+        "pdf_rereviewed": True,
+    }
+
+    monkeypatch.setattr(app, "render_stage_focus", lambda: fake_st.markdown_calls.append("WORKBOOK_STAGE"))
+
+    result = app.render_work_area(_Block(fake_st), Settings.from_env())
+
+    assert result == (None, None, None)
+    handoff_index = next(index for index, call in enumerate(fake_st.markdown_calls) if "Answer logged" in call)
+    stage_index = fake_st.markdown_calls.index("WORKBOOK_STAGE")
+    assert handoff_index < stage_index
+    assert fake_st.session_state[app.QUESTION_TRANSITION_STATE_KEY] is None
+
+
+def test_render_work_area_clears_placeholder_before_repeat_renders(monkeypatch) -> None:
+    fake_st = _FakeStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["is_running"] = True
+
+    monkeypatch.setattr(app, "render_stage_focus", lambda: None)
+
+    work_placeholder = _Block(fake_st)
+    app.render_work_area(work_placeholder, Settings.from_env())
+    app.render_work_area(work_placeholder, Settings.from_env())
+
+    assert work_placeholder.empty_count == 2
+
+
 def test_render_upload_panel_replaces_controls_immediately_on_build_click(monkeypatch) -> None:
     fake_st = _FakeStreamlit()
     fake_st.uploaded_file_value = _UploadedFile()
@@ -937,7 +977,7 @@ def test_render_stage_focus_uses_shared_workbook_stage_ui(monkeypatch, tmp_path:
     assert "Running workbook checks." in markup
     assert "Status updates" in markup
     assert "Checking the completed workbook" in markup
-    assert "Coming up" in markup
+    assert "Final review roadmap" in markup
     assert "Committed household names into the workbook." in markup
 
 
@@ -1089,7 +1129,7 @@ def test_render_workbook_stage_prefers_raw_html_renderer(monkeypatch, tmp_path: 
     fake_st.session_state["run_started"] = True
     fake_st.session_state["is_running"] = True
     fake_st.session_state["source_filename"] = "sample.pdf"
-    fake_st.session_state["stage_progress"][Stage.DATA_ENTRY.value] = (3, 7)
+    fake_st.session_state["stage_progress"][Stage.DATA_ENTRY.value] = (3, 6)
     fake_st.session_state["stage_progress"][Stage.FINANCIAL_CALCULATIONS.value] = (0, 3)
     fake_st.session_state["agent_trace"] = {
         "status": "running",
@@ -1122,15 +1162,15 @@ def test_render_workbook_stage_prefers_raw_html_renderer(monkeypatch, tmp_path: 
     assert fake_st.html_calls
     assert "immersive-workbook-shell" in fake_st.html_calls[-1]
     assert "Status updates" in fake_st.html_calls[-1]
-    assert "Coming up" in fake_st.html_calls[-1]
+    assert "Section roadmap" in fake_st.html_calls[-1]
     assert "Committed household names into the workbook." in fake_st.html_calls[-1]
-    assert "Alicia" in fake_st.html_calls[-1]
-    assert 'class="sheet-desk-summary"' in fake_st.html_calls[-1]
     assert "Fill workbook" in fake_st.html_calls[-1]
     assert 'class="agent-window-status running"' in fake_st.html_calls[-1]
     assert "Reviewing Data Input" in fake_st.html_calls[-1]
     assert "Reasoning summary" in fake_st.html_calls[-1]
     assert "Reviewing the current workbook context before writing cells." in fake_st.html_calls[-1]
+    assert "Alicia" not in fake_st.html_calls[-1]
+    assert 'class="sheet-desk-summary"' not in fake_st.html_calls[-1]
     assert 'data-elapsed-started-at-ms="120000"' in fake_st.html_calls[-1]
     assert fake_st.markdown_calls == []
 
@@ -1143,7 +1183,7 @@ def test_render_workbook_stage_falls_back_to_markdown_without_html_renderer(monk
     fake_st.session_state["run_started"] = True
     fake_st.session_state["is_running"] = True
     fake_st.session_state["source_filename"] = "sample.pdf"
-    fake_st.session_state["stage_progress"][Stage.DATA_ENTRY.value] = (3, 7)
+    fake_st.session_state["stage_progress"][Stage.DATA_ENTRY.value] = (3, 6)
     fake_st.session_state["stage_progress"][Stage.FINANCIAL_CALCULATIONS.value] = (0, 3)
     fake_st.session_state["agent_trace"] = {
         "status": "running",
@@ -1226,6 +1266,7 @@ def test_render_workbook_stage_roadmap_includes_all_sheets(monkeypatch, tmp_path
 
     markup = fake_st.html_calls[-1]
     for sheet_name in [
+        "Transactions Raw",
         "Data Input",
         "Expenses",
         "Retirement Accounts",
@@ -1234,10 +1275,15 @@ def test_render_workbook_stage_roadmap_includes_all_sheets(monkeypatch, tmp_path
         "Net Worth",
     ]:
         assert sheet_name in markup
-    assert markup.count('class="sheet-queue-item') == 6
+    assert markup.count('class="sheet-queue-item') == 7
+    assert markup.index("Transactions Raw") < markup.index("Data Input")
+    assert "Autofilled" in markup
+    assert "not generated by the agent" in markup
 
 
-def test_render_workbook_stage_collapses_empty_section_preview(monkeypatch, tmp_path: Path) -> None:
+def test_render_workbook_stage_only_shows_roadmap_without_cell_preview(
+    monkeypatch, tmp_path: Path
+) -> None:
     fake_st = _HtmlStreamlit()
     monkeypatch.setattr(app, "st", fake_st)
     app.init_state(Settings.from_env())
@@ -1245,7 +1291,7 @@ def test_render_workbook_stage_collapses_empty_section_preview(monkeypatch, tmp_
     fake_st.session_state["run_started"] = True
     fake_st.session_state["is_running"] = True
     fake_st.session_state["source_filename"] = "sample.pdf"
-    fake_st.session_state["stage_progress"][Stage.DATA_ENTRY.value] = (1, 7)
+    fake_st.session_state["stage_progress"][Stage.DATA_ENTRY.value] = (1, 6)
     fake_st.session_state["stage_progress"][Stage.FINANCIAL_CALCULATIONS.value] = (0, 3)
     fake_st.session_state["agent_trace"] = {
         "status": "running",
@@ -1267,8 +1313,9 @@ def test_render_workbook_stage_collapses_empty_section_preview(monkeypatch, tmp_
     app.render_workbook_stage()
 
     markup = fake_st.html_calls[-1]
-    assert "Entries will appear here" in markup
-    assert "Saved entries will appear here as soon as they are ready." in markup
+    assert "Section roadmap" in markup
+    assert "Entries will appear here" not in markup
+    assert "Saved entries will appear here as soon as they are ready." not in markup
     assert "Cell B10" not in markup
 
 
@@ -1282,7 +1329,7 @@ def test_render_workbook_stage_hides_stale_question_during_resume_handoff(
     fake_st.session_state["run_started"] = True
     fake_st.session_state["is_running"] = True
     fake_st.session_state["source_filename"] = "sample.pdf"
-    fake_st.session_state["stage_progress"][Stage.DATA_ENTRY.value] = (1, 7)
+    fake_st.session_state["stage_progress"][Stage.DATA_ENTRY.value] = (1, 6)
     fake_st.session_state["stage_progress"][Stage.FINANCIAL_CALCULATIONS.value] = (0, 3)
     fake_st.session_state["agent_trace"] = {
         "status": "running",
@@ -1341,7 +1388,80 @@ def test_render_workbook_stage_hides_stale_question_during_resume_handoff(
     assert "Needs your input" not in markup
     assert question.prompt not in markup
     assert "Waiting for your answer before workbook entry can continue." not in markup
-    assert "This section is being reviewed. Saved entries will appear here as soon as they are ready." in markup
+    assert "Section roadmap" in markup
+    assert "Expenses is active now. 1/6 sections are complete so far." in markup
+
+
+def test_render_workbook_stage_uses_neutral_waiting_copy_for_pending_question(
+    monkeypatch, tmp_path: Path
+) -> None:
+    fake_st = _HtmlStreamlit()
+    monkeypatch.setattr(app, "st", fake_st)
+    app.init_state(Settings.from_env())
+    fake_st.session_state["active_stage"] = Stage.DATA_ENTRY.value
+    fake_st.session_state["run_started"] = True
+    fake_st.session_state["is_running"] = False
+    fake_st.session_state["source_filename"] = "sample.pdf"
+    fake_st.session_state["stage_progress"][Stage.DATA_ENTRY.value] = (1, 6)
+    fake_st.session_state["agent_trace"] = {
+        "status": "needs_input",
+        "current_sheet": "Expenses",
+        "message": "Workbook entry is waiting for planner confirmation.",
+        "token_count": 0,
+        "started_at_ms": None,
+        "retry_until_ms": None,
+        "live_summary": None,
+        "live_summary_updated_at_ms": None,
+        "last_rendered_summary": None,
+        "recent_events": [],
+    }
+    question = AgentQuestion(
+        id="expenses-monthly-totals",
+        sheet_name="Expenses",
+        prompt="Please provide the monthly totals by expense line item.",
+        rationale="The transactions tab still needs category cleanup.",
+    )
+    state_path = tmp_path / "entry_state.json"
+    save_entry_state(
+        state_path,
+        EntrySessionState(
+            job_id="job-123",
+            template_sha256="template-sha",
+            workbook_path=tmp_path / "output.xlsx",
+            ocr_results_path=tmp_path / "ocr_results.json",
+            current_sheet_index=1,
+            sheet_order=["Data Input", "Expenses", "Retirement Accounts"],
+            pending_question=question,
+            sheet_summaries=[
+                SheetEntrySummary(
+                    sheet_name="Data Input",
+                    status="completed",
+                    mapped_count=2,
+                    message="Committed household names into the workbook.",
+                ),
+                SheetEntrySummary(
+                    sheet_name="Expenses",
+                    status="needs_input",
+                    message=question.prompt,
+                ),
+            ],
+        ),
+    )
+    fake_st.session_state["result"] = ImportArtifacts(
+        success=False,
+        job_id="job-123",
+        job_dir=tmp_path,
+        entry_state_path=state_path,
+        pending_question=question,
+    )
+
+    app.render_workbook_stage()
+
+    markup = fake_st.html_calls[-1]
+    assert "Needs your input" not in markup
+    assert question.prompt not in markup
+    assert "Waiting" in markup
+    assert "Workbook entry is waiting for planner confirmation." in markup
 
 
 def test_render_masthead_prefers_raw_html_renderer_when_available(monkeypatch) -> None:
@@ -1357,7 +1477,20 @@ def test_render_masthead_prefers_raw_html_renderer_when_available(monkeypatch) -
         "message": "LangGraph is working on Data Input.",
         "severity": Severity.INFO,
     }
+    fake_st.session_state["agent_trace"] = {
+        "status": "running",
+        "current_sheet": "Data Input",
+        "message": "LangGraph is working on Data Input.",
+        "token_count": 0,
+        "started_at_ms": 120000,
+        "retry_until_ms": None,
+        "live_summary": None,
+        "live_summary_updated_at_ms": None,
+        "last_rendered_summary": None,
+        "recent_events": [],
+    }
 
+    monkeypatch.setattr(app.time, "time", lambda: 121.0)
     settings_clicked = app.render_masthead()
 
     assert settings_clicked is False
@@ -1368,6 +1501,7 @@ def test_render_masthead_prefers_raw_html_renderer_when_available(monkeypatch) -
     assert "Stage 2 of 2" in fake_st.html_calls[-1]
     assert "LangGraph is working on Data Input." in fake_st.html_calls[-1]
     assert "In progress" in fake_st.html_calls[-1]
+    assert 'data-elapsed-started-at-ms="120000"' in fake_st.html_calls[-1]
 
 
 def test_render_masthead_falls_back_to_markdown_without_html_renderer(monkeypatch) -> None:
@@ -1453,7 +1587,7 @@ def test_render_entry_question_supports_figure_it_out(monkeypatch) -> None:
     )
 
     assert (answer, source, submitted) == (None, None, False)
-    assert fake_st.dialog_calls[-1]["title"] == app.QUESTION_DIALOG_TITLE
+    assert fake_st.dialog_calls == []
     assert fake_st.rerun_called is True
     assert any("Planner decision required" in call for call in fake_st.markdown_calls)
     assert not any("Affected targets" in call for call in fake_st.markdown_calls)
@@ -1479,6 +1613,7 @@ def test_render_entry_question_supports_figure_it_out(monkeypatch) -> None:
     assert submitted is True
     assert answer == ""
     assert source == "agent"
+    assert any("Answer logged" in call for call in fake_st.markdown_calls)
 
 
 def test_render_entry_question_prefers_custom_answer(monkeypatch) -> None:
@@ -1507,7 +1642,7 @@ def test_render_entry_question_prefers_custom_answer(monkeypatch) -> None:
     )
 
     assert (answer, source, submitted) == (None, None, False)
-    assert fake_st.dialog_calls[-1]["title"] == app.QUESTION_DIALOG_TITLE
+    assert fake_st.dialog_calls == []
     assert fake_st.rerun_called is True
 
     answer, source, submitted = app.render_entry_question(
@@ -1528,6 +1663,7 @@ def test_render_entry_question_prefers_custom_answer(monkeypatch) -> None:
     assert submitted is True
     assert answer == "Jordan"
     assert source == "free_text"
+    assert any("Answer logged" in call for call in fake_st.markdown_calls)
 
 
 def test_render_ocr_parallel_uses_live_card_and_consumes_flash(monkeypatch) -> None:

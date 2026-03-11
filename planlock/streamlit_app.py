@@ -21,8 +21,8 @@ from planlock.config import (
 from planlock.job_runner import JobRunner
 from planlock.models import AgentQuestion, EntrySessionState, ImportArtifacts, RunEvent, Severity, Stage
 from planlock.pdf_renderer import render_pdf_previews
-from planlock.template_entry_agent import load_entry_state
-from planlock.template_schema import ALLOWED_WRITE_CELLS_BY_SHEET, TEMPLATE_SHEET_ORDER
+from planlock.template_entry_agent import default_sheet_order, load_entry_state
+from planlock.transactions_query import TRANSACTIONS_SHEET_NAME
 
 
 st.set_page_config(
@@ -32,10 +32,10 @@ st.set_page_config(
 
 
 COOLDOWN_HANDOFF_ANIMATION_MS = 420
-QUESTION_DIALOG_TITLE = "Decision Gate"
 QUESTION_SUBMISSION_STATE_KEY = "entry_question_submission"
 QUESTION_PENDING_RESUME_STATE_KEY = "entry_question_pending_resume"
 QUESTION_ACTIVE_RESUME_STATE_KEY = "entry_question_active_resume"
+QUESTION_TRANSITION_STATE_KEY = "entry_question_transition"
 QUESTION_WIDGET_STATE_KEY = "entry_question_widgets"
 PROVIDER_LOGO_URLS = {
     "openai": "https://us1.discourse-cdn.com/openai1/original/4X/3/2/1/321a1ba297482d3d4060d114860de1aa5610f8a9.png",
@@ -117,6 +117,53 @@ def render_html_block(markup: str) -> None:
         html_renderer(markup)
         return
     st.markdown(markup, unsafe_allow_html=True)
+
+
+def build_entry_question_shell_markup(
+    *,
+    sheet_name: str,
+    prompt: str,
+    progress_text: str,
+    pdf_rereviewed: bool,
+    state: str,
+) -> str:
+    progress_chip = ""
+    if progress_text != "Progress unavailable":
+        progress_chip = f'<div class="question-chip">{html.escape(progress_text)}</div>'
+
+    rereview_chip = ""
+    if pdf_rereviewed:
+        rereview_chip = '<div class="question-chip signal">Raw PDF re-reviewed</div>'
+
+    state_chip = ""
+    body_copy = (
+        "Choose the best supported answer below, or hand it back to the model if you want it to make the final call."
+    )
+    if state == "exiting":
+        state_chip = '<div class="question-chip success">Answer logged</div>'
+        body_copy = "Answer captured. Workbook entry is resuming for this section now."
+
+    return dedent(
+        f"""
+        <section class="question-shell is-inline is-{html.escape(state)}">
+            <div class="question-panel">
+                <div class="question-header">
+                    <div class="question-header-row">
+                        <div class="question-kicker">Planner decision required</div>
+                        <div class="question-meta-strip">
+                            <div class="question-chip">{html.escape(sheet_name)}</div>
+                            {progress_chip}
+                            {rereview_chip}
+                            {state_chip}
+                        </div>
+                    </div>
+                    <h3 class="question-title">{html.escape(prompt)}</h3>
+                    <p class="question-copy">{html.escape(body_copy)}</p>
+                </div>
+            </div>
+        </section>
+        """
+    ).strip()
 
 
 def rerun_app() -> None:
@@ -491,6 +538,24 @@ def inject_styles() -> None:
             text-transform: uppercase;
             font-weight: 700;
             color: rgba(23, 50, 77, 0.68);
+        }
+
+        .stage-state-live {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.28rem;
+            flex-wrap: wrap;
+        }
+
+        .stage-state-live-separator {
+            opacity: 0.54;
+        }
+
+        .stage-state-live-timer,
+        .stage-state-live-timer .ocr-live-elapsed {
+            font-variant-numeric: tabular-nums;
+            text-transform: none;
+            letter-spacing: normal;
         }
 
         .taskbar-stage.is-active .taskbar-stage-label,
@@ -1883,6 +1948,11 @@ def inject_styles() -> None:
             border-style: dashed;
         }
 
+        .sheet-queue-item.autofilled {
+            border-color: rgba(23, 50, 77, 0.14);
+            background: rgba(229, 239, 246, 0.92);
+        }
+
         .sheet-queue-name {
             font-size: 0.96rem;
             line-height: 1.2;
@@ -2140,30 +2210,51 @@ def inject_styles() -> None:
         }
 
         .question-shell {
+            position: relative;
             display: grid;
-            gap: 0.65rem;
+            gap: 0.72rem;
+            width: 100%;
         }
 
         .question-shell.is-inline {
-            margin-top: 0.85rem;
+            margin: 0 0 0.95rem;
         }
 
-        .question-shell.is-modal {
-            margin-top: 0.15rem;
+        .question-shell.is-live {
+            animation: questionSectionIn 380ms cubic-bezier(0.22, 1, 0.36, 1) both;
+        }
+
+        .question-shell.is-exiting {
+            animation: questionSectionOut 260ms cubic-bezier(0.55, 0, 0.75, 0) both;
+            transform-origin: top center;
+            pointer-events: none;
         }
 
         .question-panel {
-            padding: 0.95rem 1rem 0.9rem;
+            position: relative;
+            overflow: hidden;
+            padding: 1.05rem 1.12rem 1rem;
             border-radius: var(--radius-xl);
             border: 1px solid rgba(23, 50, 77, 0.1);
             background:
+                radial-gradient(circle at top right, rgba(23, 50, 77, 0.12), transparent 28%),
                 linear-gradient(180deg, rgba(255, 251, 244, 0.98) 0%, rgba(248, 242, 233, 0.98) 100%);
-            box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.86);
+            box-shadow:
+                inset 0 1px 0 rgba(255, 255, 255, 0.86),
+                0 18px 32px rgba(15, 23, 32, 0.08);
+        }
+
+        .question-panel::before {
+            content: "";
+            position: absolute;
+            inset: 0 auto 0 0;
+            width: 0.42rem;
+            background: linear-gradient(180deg, rgba(201, 149, 50, 0.95), rgba(23, 50, 77, 0.9));
         }
 
         .question-header {
             display: grid;
-            gap: 0.55rem;
+            gap: 0.62rem;
         }
 
         .question-header-row {
@@ -2210,6 +2301,12 @@ def inject_styles() -> None:
             background: rgba(245, 230, 196, 0.88);
         }
 
+        .question-chip.success {
+            border-color: rgba(29, 115, 72, 0.24);
+            background: rgba(220, 243, 231, 0.9);
+            color: var(--success);
+        }
+
         .question-title {
             margin: 0;
             font-family: var(--display-font) !important;
@@ -2219,29 +2316,12 @@ def inject_styles() -> None:
             color: var(--ink);
         }
 
-        [data-testid="stDialog"] .question-panel {
-            padding: 0.85rem 0.95rem 0.75rem;
-        }
-
-        [data-testid="stDialog"] .question-title {
-            font-size: clamp(1.75rem, 2.35vw, 2.35rem);
-            line-height: 0.97;
-        }
-
-        [data-testid="stDialog"] label[data-testid="stWidgetLabel"] {
-            font-size: 0.68rem !important;
-            letter-spacing: 0.16em !important;
-            text-transform: uppercase;
-            font-weight: 800 !important;
-            color: var(--accent) !important;
-        }
-
-        [data-testid="stDialog"] [data-testid="stMarkdownContainer"] p {
-            color: var(--ink) !important;
-        }
-
-        [data-testid="stDialog"] form {
-            margin-top: 0.15rem;
+        .question-copy {
+            margin: 0;
+            max-width: 70rem;
+            color: var(--muted);
+            font-size: 0.98rem;
+            line-height: 1.5;
         }
 
         .ocr-grid {
@@ -2890,6 +2970,37 @@ def inject_styles() -> None:
             }
         }
 
+        @keyframes questionSectionIn {
+            0% {
+                opacity: 0;
+                transform: translateY(1rem) scale(0.985);
+                filter: blur(8px);
+            }
+            62% {
+                opacity: 1;
+                transform: translateY(-0.08rem) scale(1.006);
+                filter: blur(0);
+            }
+            100% {
+                opacity: 1;
+                transform: translateY(0) scale(1);
+                filter: blur(0);
+            }
+        }
+
+        @keyframes questionSectionOut {
+            0% {
+                opacity: 1;
+                transform: translateY(0) scale(1);
+                filter: blur(0);
+            }
+            100% {
+                opacity: 0;
+                transform: translateY(-0.7rem) scale(0.985);
+                filter: blur(5px);
+            }
+        }
+
         @keyframes agentPulse {
             0%, 100% {
                 transform: scale(1);
@@ -2979,6 +3090,8 @@ def inject_styles() -> None:
             .workbook-setup-step,
             .workbook-setup-step::before,
             .workbook-setup-step-fill,
+            .question-shell,
+            .question-panel,
             .stButton > button,
             .stDownloadButton > button {
                 animation: none !important;
@@ -3065,7 +3178,7 @@ def inject_styles() -> None:
                 display: grid;
             }
 
-            .question-shell.is-modal {
+            .question-shell {
                 grid-template-columns: 1fr;
             }
 
@@ -3154,6 +3267,7 @@ def init_state(settings: Settings) -> None:
     st.session_state.setdefault(QUESTION_SUBMISSION_STATE_KEY, None)
     st.session_state.setdefault(QUESTION_PENDING_RESUME_STATE_KEY, None)
     st.session_state.setdefault(QUESTION_ACTIVE_RESUME_STATE_KEY, None)
+    st.session_state.setdefault(QUESTION_TRANSITION_STATE_KEY, None)
     st.session_state.setdefault(QUESTION_WIDGET_STATE_KEY, {})
     runtime_defaults = build_runtime_settings_state(settings)
     runtime_settings = st.session_state.setdefault("runtime_settings", runtime_defaults)
@@ -3236,7 +3350,7 @@ def agent_trace_status_label(status: str) -> str:
         "idle": "Standby",
         "running": "In progress",
         "retrying": "Paused",
-        "needs_input": "Needs your input",
+        "needs_input": "Waiting",
         "validating": "Final check",
         "review": "Needs review",
         "complete": "Complete",
@@ -3288,10 +3402,9 @@ def summarize_agent_trace_event(event: RunEvent) -> tuple[str, str, str] | None:
         if event.phase == "retry":
             return ("Paused", event.detail_message or event.message, "warn")
         if event.phase == "paused":
-            pending_question = event.artifacts.pending_question if event.artifacts is not None else None
             return (
-                "Needs your input",
-                pending_question.prompt if pending_question is not None else event.message,
+                "Waiting",
+                "Planner confirmation is pending for the current section.",
                 "warn",
             )
         if event.phase == "failed":
@@ -3364,18 +3477,15 @@ def sync_agent_trace_from_event(event: RunEvent) -> None:
             return
 
         if event.phase == "paused":
-            pending_question = event.artifacts.pending_question if event.artifacts is not None else None
             trace.update(
                 {
                     "status": "needs_input",
                     "current_sheet": (
-                        pending_question.sheet_name if pending_question is not None else current_sheet
+                        event.artifacts.pending_question.sheet_name
+                        if event.artifacts is not None and event.artifacts.pending_question is not None
+                        else current_sheet
                     ),
-                    "message": (
-                        pending_question.prompt
-                        if pending_question is not None
-                        else "Workbook entry is waiting for planner input."
-                    ),
+                    "message": "Workbook entry is waiting for planner confirmation.",
                     "started_at_ms": None,
                     "retry_until_ms": None,
                 }
@@ -3495,7 +3605,7 @@ def build_agent_trace_headline(trace: dict[str, object]) -> str:
     if status == "retrying" and current_sheet:
         return f"Paused on {current_sheet}"
     if status == "needs_input" and current_sheet:
-        return f"Waiting for your answer on {current_sheet}"
+        return f"Waiting on {current_sheet}"
     if status == "validating":
         return "Checking the completed workbook"
     if status == "review":
@@ -3578,35 +3688,9 @@ def determine_focus_sheet(entry_state: EntrySessionState | None, active_stage: S
     return entry_state.sheet_order[focus_index]
 
 
-def format_sheet_value(value: object) -> str:
-    if value in (None, ""):
-        return "Waiting for value"
-    if isinstance(value, bool):
-        return "TRUE" if value else "FALSE"
-    return str(value)
-
-
-def describe_assignment_title(assignment: object) -> str:
-    semantic_key = str(getattr(assignment, "semantic_key", "") or "").strip()
-    cell_ref = str(getattr(assignment, "cell", "") or "").strip()
-    if not semantic_key:
-        return f"Workbook field {cell_ref}" if cell_ref else "Workbook field"
-
-    parts = [part for part in semantic_key.split(".") if part]
-    title = parts[-1].replace("_", " ").strip().title() if parts else semantic_key
-    if len(parts) >= 2 and parts[-2].startswith("client_"):
-        owner = parts[-2].replace("_", " ").strip().title()
-        return f"{title} ({owner})"
-    return title
-
-
-def describe_assignment_detail(assignment: object) -> str:
-    parts = [f"Workbook cell {getattr(assignment, 'cell', '')}"]
-    source_pages = list(getattr(assignment, "source_pages", []) or [])
-    if source_pages:
-        page_label = "Source page" if len(source_pages) == 1 else "Source pages"
-        parts.append(f"{page_label} {', '.join(str(page) for page in source_pages)}")
-    return " • ".join(part for part in parts if part.strip())
+def build_roadmap_sheet_order(sheet_order: list[str]) -> list[str]:
+    ordered = [sheet_name for sheet_name in sheet_order if sheet_name != TRANSACTIONS_SHEET_NAME]
+    return [TRANSACTIONS_SHEET_NAME, *ordered]
 
 
 def build_sheet_queue_markup(
@@ -3616,28 +3700,37 @@ def build_sheet_queue_markup(
     active_stage: Stage,
 ) -> str:
     if entry_state is None or not entry_state.sheet_order:
-        sheet_order = list(TEMPLATE_SHEET_ORDER)
+        workflow_order = default_sheet_order()
         current_sheet_index = 0
         pending_sheet = None
         summary_map: dict[str, object] = {}
     else:
-        sheet_order = entry_state.sheet_order
+        workflow_order = entry_state.sheet_order
         current_sheet_index = entry_state.current_sheet_index
         pending_sheet = entry_state.pending_question.sheet_name if entry_state.pending_question is not None else None
         summary_map = {summary.sheet_name: summary for summary in entry_state.sheet_summaries}
+
+    sheet_order = build_roadmap_sheet_order(workflow_order)
+    workflow_index_by_sheet = {sheet_name: index for index, sheet_name in enumerate(workflow_order)}
 
     items: list[tuple[int, str, str]] = []
     for index, sheet_name in enumerate(sheet_order):
         summary = summary_map.get(sheet_name)
         status_label = "Up next"
         tone = "pending"
-        if getattr(summary, "status", None) == "skipped":
+        actual_index = workflow_index_by_sheet.get(sheet_name)
+        if sheet_name == TRANSACTIONS_SHEET_NAME:
+            status_label = "Autofilled"
+            tone = "autofilled"
+        elif getattr(summary, "status", None) == "skipped":
             status_label = "No changes"
             tone = "skipped"
         elif pending_sheet == sheet_name or getattr(summary, "status", None) == "needs_input":
-            status_label = "Needs your input"
+            status_label = "Waiting"
             tone = "needs-input"
-        elif active_stage == Stage.FINANCIAL_CALCULATIONS or index < current_sheet_index:
+        elif actual_index is not None and (
+            active_stage == Stage.FINANCIAL_CALCULATIONS or actual_index < current_sheet_index
+        ):
             status_label = "Done"
             tone = "complete"
         elif focus_sheet == sheet_name and active_stage == Stage.DATA_ENTRY:
@@ -3647,16 +3740,22 @@ def build_sheet_queue_markup(
         mapped_count = int(getattr(summary, "mapped_count", 0) or 0)
         unresolved_count = int(getattr(summary, "unresolved_count", 0) or 0)
         touched_cells = len(getattr(summary, "touched_cells", []) or [])
-        if tone == "complete":
-            meta = (
-                f"{mapped_count} entries saved"
-                if mapped_count > 0
-                else f"{touched_cells} cells updated"
-                if touched_cells > 0
-                else "This section is complete."
+        if tone == "autofilled":
+            meta = getattr(summary, "message", None) or (
+                "Starter transaction rows are already in the workbook. This tab is not generated by the agent."
             )
+        elif tone == "complete":
+            completed_meta = getattr(summary, "message", None)
+            if completed_meta:
+                meta = completed_meta
+            elif mapped_count > 0:
+                meta = f"{mapped_count} entries saved"
+            elif touched_cells > 0:
+                meta = f"{touched_cells} cells updated"
+            else:
+                meta = "This section is complete."
         elif tone == "needs-input":
-            meta = getattr(summary, "message", None) or "We need one answer before this section can continue."
+            meta = "Waiting on one answer before this section can continue."
         elif tone == "active":
             meta = getattr(summary, "message", None) or (
                 f"{mapped_count} entries saved so far"
@@ -3691,193 +3790,40 @@ def build_sheet_queue_markup(
     return "".join(markup for _, _, markup in items)
 
 
-def build_sheet_cells_markup(
-    *,
-    entry_state: EntrySessionState | None,
-    focus_sheet: str | None,
-    active_stage: Stage,
-) -> tuple[str, str, str]:
-    if focus_sheet is None:
-        return (
-            "Final review",
-            "The completed workbook is being checked before release.",
-            (
-                '<div class="sheet-cell is-empty sheet-cell-empty-state">'
-                '<div class="sheet-cell-title">Final review is in progress</div>'
-                '<div class="sheet-cell-detail">The completed workbook is being checked before it is released.</div>'
-                "</div>"
-            ),
-        )
-
-    summary = None
-    assignments_by_cell: dict[str, object] = {}
-    if entry_state is not None:
-        summary = next((item for item in entry_state.sheet_summaries if item.sheet_name == focus_sheet), None)
-        assignments_by_cell = {
-            assignment.cell: assignment
-            for assignment in entry_state.mapped_assignments
-            if assignment.sheet_name == focus_sheet
-        }
-
-    visible_cells = list(getattr(summary, "touched_cells", []) or [])
-    if not visible_cells:
-        visible_cells = sorted(ALLOWED_WRITE_CELLS_BY_SHEET.get(focus_sheet, set()))[:12]
-    else:
-        visible_cells = visible_cells[:12]
-
-    if not visible_cells:
-        empty_copy = (
-            "This area becomes active when the runner reaches a workbook section with editable fields."
-            if active_stage == Stage.DATA_ENTRY
-            else "Final review is running on the completed workbook."
-        )
-        return (
-            focus_sheet,
-            getattr(summary, "message", None) or empty_copy,
-            (
-                '<div class="sheet-cell is-empty sheet-cell-empty-state">'
-                f'<div class="sheet-cell-title">{html.escape("Entries will appear here" if active_stage == Stage.DATA_ENTRY else "Final review is in progress")}</div>'
-                f'<div class="sheet-cell-detail">{html.escape(empty_copy)}</div>'
-                "</div>"
-            ),
-        )
-
-    filled_cells = [cell_ref for cell_ref in visible_cells if cell_ref in assignments_by_cell][:8]
-    if not filled_cells:
-        empty_copy = getattr(summary, "message", None) or (
-            "This section is being reviewed. Saved entries will appear here as soon as they are ready."
-            if active_stage == Stage.DATA_ENTRY
-            else "The completed workbook is being checked before release."
-        )
-        empty_title = "Entries will appear here" if active_stage == Stage.DATA_ENTRY else "Final review is in progress"
-        return (
-            focus_sheet,
-            empty_copy,
-            dedent(
-                f"""
-                <div class="sheet-cell is-empty sheet-cell-empty-state">
-                    <div class="sheet-cell-title">{html.escape(empty_title)}</div>
-                    <div class="sheet-cell-detail">{html.escape(empty_copy)}</div>
-                </div>
-                """
-            ).strip(),
-        )
-
-    cells: list[str] = []
-    for cell_ref in filled_cells:
-        assignment = assignments_by_cell[cell_ref]
-        cells.append(
-            dedent(
-                f"""
-                <div class="sheet-cell is-filled">
-                    <div class="sheet-cell-label">Cell {html.escape(cell_ref)}</div>
-                    <div class="sheet-cell-title">{html.escape(describe_assignment_title(assignment))}</div>
-                    <div class="sheet-cell-value">{html.escape(format_sheet_value(getattr(assignment, "value", None)))}</div>
-                    <div class="sheet-cell-detail">{html.escape(describe_assignment_detail(assignment))}</div>
-                </div>
-                """
-            ).strip()
-        )
-
-    copy = getattr(summary, "message", None) or "Latest saved entries for this section appear here."
-    return focus_sheet, copy, "".join(cells)
-
-
 def build_sheet_desk_markup(
     *,
     entry_state: EntrySessionState | None,
     active_stage: Stage,
     source_filename: str,
     current_phase: str,
-    workbook_message: str,
-    mapping_completed: int,
-    mapping_total: int,
-    checks_completed: int,
-    checks_total: int,
-    mapping_state: str,
     mapping_copy: str,
-    checks_state: str,
     checks_copy: str,
 ) -> str:
     focus_sheet = determine_focus_sheet(entry_state, active_stage)
-    desk_title = focus_sheet if focus_sheet is not None else "Workbook review"
     queue_markup = build_sheet_queue_markup(
         entry_state=entry_state,
         focus_sheet=focus_sheet,
         active_stage=active_stage,
     )
-    preview_title, preview_copy, cell_markup = build_sheet_cells_markup(
-        entry_state=entry_state,
-        focus_sheet=focus_sheet,
-        active_stage=active_stage,
-    )
-    progress_total = mapping_total if active_stage == Stage.DATA_ENTRY else checks_total
-    progress_completed = mapping_completed if active_stage == Stage.DATA_ENTRY else checks_completed
-    progress_ratio = min(max(progress_completed / progress_total, 0), 1) if progress_total > 0 else 0.0
-    progress_title = (
-        f"{mapping_completed} of {mapping_total} sections complete"
-        if active_stage == Stage.DATA_ENTRY
-        else f"{checks_completed} of {checks_total} final checks complete"
-    )
-    progress_copy = mapping_copy if active_stage == Stage.DATA_ENTRY else checks_copy
-    now_title = current_phase
-    now_copy = mapping_copy if active_stage == Stage.DATA_ENTRY else checks_copy
-    next_title = "Final review" if active_stage == Stage.DATA_ENTRY else "Release workbook"
-    next_copy = (
-        checks_copy
-        if active_stage == Stage.DATA_ENTRY
-        else "The workbook will be ready as soon as the final review finishes."
-    )
-    next_state = checks_state if active_stage == Stage.DATA_ENTRY else "In progress"
+    roadmap_title = "Section roadmap" if active_stage == Stage.DATA_ENTRY else "Final review roadmap"
+    roadmap_copy = mapping_copy if active_stage == Stage.DATA_ENTRY else checks_copy
+    source_copy = f"Source file: {source_filename}"
+    if active_stage == Stage.DATA_ENTRY and focus_sheet is not None:
+        roadmap_copy = f"{focus_sheet} is active now. {roadmap_copy}"
 
     return dedent(
         f"""
         <section class="sheet-desk">
-            <div class="sheet-desk-header">
+            <div class="sheet-queue-head">
                 <div>
-                    <div class="sheet-desk-kicker">Workbook</div>
-                    <div class="sheet-desk-title">{html.escape(desk_title)}</div>
-                    <div class="sheet-desk-copy">{html.escape(workbook_message)}</div>
+                    <div class="sheet-queue-kicker">Roadmap</div>
+                    <div class="sheet-queue-title">{html.escape(roadmap_title)}</div>
                 </div>
                 <div class="workbook-stage-pill">{html.escape(current_phase)}</div>
             </div>
-            <div class="sheet-desk-copy">Source file: {html.escape(source_filename)}</div>
-            <div class="sheet-desk-summary">
-                <div class="sheet-desk-summary-card is-primary">
-                    <div class="sheet-desk-summary-label">Now</div>
-                    <div class="sheet-desk-summary-title">{html.escape(now_title)}</div>
-                    <div class="sheet-desk-summary-copy">{html.escape(now_copy)} ({html.escape(mapping_state if active_stage == Stage.DATA_ENTRY else checks_state)})</div>
-                </div>
-                <div class="sheet-desk-summary-card">
-                    <div class="sheet-desk-summary-label">Progress</div>
-                    <div class="sheet-desk-summary-title">{html.escape(progress_title)}</div>
-                    <div class="sheet-desk-summary-meter"><span style="width: {progress_ratio * 100:.1f}%"></span></div>
-                    <div class="sheet-desk-summary-copy">{html.escape(next_title)}: {html.escape(next_copy)} ({html.escape(next_state)})</div>
-                </div>
-            </div>
-            <div class="sheet-desk-surface">
-                <section class="sheet-preview-card">
-                    <div class="sheet-preview-head">
-                        <div>
-                            <div class="sheet-preview-kicker">Current section</div>
-                            <div class="sheet-preview-title">{html.escape(preview_title)}</div>
-                        </div>
-                        <div class="sheet-preview-pill">{html.escape(current_phase)}</div>
-                    </div>
-                    <div class="sheet-preview-copy">{html.escape(preview_copy)}</div>
-                    <div class="sheet-cell-grid">{cell_markup}</div>
-                </section>
-                <aside class="sheet-queue-card">
-                    <div class="sheet-queue-head">
-                        <div>
-                            <div class="sheet-queue-kicker">Roadmap</div>
-                            <div class="sheet-queue-title">Coming up</div>
-                        </div>
-                    </div>
-                    <div class="sheet-queue-copy">The remaining sections stay visible here so it is clear what is done and what is next.</div>
-                    <div class="sheet-queue-list">{queue_markup}</div>
-                </aside>
-            </div>
+            <div class="sheet-queue-copy">{html.escape(roadmap_copy)}</div>
+            <div class="sheet-queue-copy">{html.escape(source_copy)}</div>
+            <div class="sheet-queue-list">{queue_markup}</div>
         </section>
         """
     ).strip()
@@ -3919,7 +3865,7 @@ def build_workbook_setup_markup(
     runtime_settings = dict(st.session_state.get("runtime_settings", {}))
     lane_count = max(int(runtime_settings.get("ocr_parallel_workers") or DEFAULT_OCR_PARALLEL_WORKERS), 1)
     retry_budget = max(int(runtime_settings.get("llm_max_retries") or 0), 0)
-    sheet_total = max(int(mapping_total or 0), len(TEMPLATE_SHEET_ORDER))
+    sheet_total = max(int(mapping_total or 0), len(default_sheet_order()))
     checks_total_safe = max(int(checks_total or 0), 1)
     setup_copy = status_message.strip() or "Preparing the workbook and waiting for the first section to begin."
 
@@ -4209,6 +4155,7 @@ def reset_run_state(pipe_total: int, source_filename: str, page_previews: dict[i
     st.session_state[QUESTION_SUBMISSION_STATE_KEY] = None
     st.session_state[QUESTION_PENDING_RESUME_STATE_KEY] = None
     st.session_state[QUESTION_ACTIVE_RESUME_STATE_KEY] = None
+    st.session_state[QUESTION_TRANSITION_STATE_KEY] = None
     st.session_state[QUESTION_WIDGET_STATE_KEY] = {}
 
 
@@ -4616,7 +4563,7 @@ def build_workflow_stage_cards() -> list[dict[str, object]]:
             state_label = "Complete"
         elif is_active:
             if stage == Stage.DATA_ENTRY and needs_input:
-                state_label = "Needs input"
+                state_label = "Waiting"
             elif is_running:
                 state_label = "In progress"
             elif run_started and last_status is not None and last_status["severity"] == Severity.ERROR:
@@ -4639,6 +4586,61 @@ def build_workflow_stage_cards() -> list[dict[str, object]]:
         )
 
     return cards
+
+
+def stage_state_started_at_ms(stage: Stage | str) -> int | None:
+    stage_enum = workflow_stage(stage)
+    if stage_enum == Stage.OCR:
+        pipeline = st.session_state.get("ocr_pipeline", {})
+        if not isinstance(pipeline, dict):
+            return None
+        candidates: list[int] = []
+        for pipe in pipeline.get("pipes", []):
+            if not isinstance(pipe, dict) or str(pipe.get("status") or "") not in {"running", "retrying"}:
+                continue
+            started_at_ms = pipe.get("started_at_ms")
+            try:
+                if started_at_ms is not None:
+                    candidates.append(int(started_at_ms))
+            except (TypeError, ValueError):
+                continue
+        return min(candidates) if candidates else None
+
+    trace = st.session_state.get("agent_trace", {})
+    if not isinstance(trace, dict):
+        return None
+
+    started_at_ms = trace.get("started_at_ms")
+    try:
+        return int(started_at_ms) if started_at_ms is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def build_stage_state_markup(card: dict[str, object]) -> str:
+    state_label = str(card["state_label"])
+    if not card.get("is_active") or state_label != "In progress":
+        return html.escape(state_label)
+
+    started_at_ms = stage_state_started_at_ms(card["stage"])
+    if started_at_ms is None:
+        return html.escape(state_label)
+
+    now_ms = int(time.time() * 1000)
+    elapsed_seconds = max((now_ms - started_at_ms) / 1000, 0.0)
+    timer_markup = build_timing_markup(
+        format_seconds_label(elapsed_seconds),
+        elapsed_started_at_ms=started_at_ms,
+    )
+    return dedent(
+        f"""
+        <span class="stage-state-live">
+            <span class="stage-state-live-label">{html.escape(state_label)}</span>
+            <span class="stage-state-live-separator" aria-hidden="true">•</span>
+            <span class="stage-state-live-timer">{timer_markup}</span>
+        </span>
+        """
+    ).strip()
 
 
 def build_taskbar_markup() -> str:
@@ -4690,7 +4692,7 @@ def build_taskbar_markup() -> str:
                 <span class="taskbar-stage-index">{card['index']}</span>
                 <span class="taskbar-stage-copy">
                     <span class="taskbar-stage-label">{html.escape(str(card['name'] if card['is_active'] else card['compact_name']))}</span>
-                    <span class="taskbar-stage-state">{html.escape(str(card['state_label']))}</span>
+                    <span class="taskbar-stage-state">{build_stage_state_markup(card)}</span>
                 </span>
             </div>
             """
@@ -4847,7 +4849,7 @@ def render_stage_progress() -> None:
                 <div class="{' '.join(classes)}">
                     <div class="stage-chip-number">Step {card['index']}</div>
                     <div class="stage-chip-name">{html.escape(str(card['name'] if card['is_active'] else card['compact_name']))}</div>
-                    <div class="stage-chip-state">{html.escape(str(card['state_label']))}</div>
+                    <div class="stage-chip-state">{build_stage_state_markup(card)}</div>
                 </div>
                 """
             ).strip()
@@ -5230,30 +5232,22 @@ def render_workbook_stage() -> None:
 
     mapping_done = mapping_completed >= mapping_total and mapping_total > 0
     if needs_input and active_stage == Stage.DATA_ENTRY:
-        mapping_state = "Needs your input"
-        mapping_copy = "Waiting for your answer before workbook entry can continue."
+        mapping_copy = "Waiting on the current section before workbook entry can continue."
     elif mapping_done:
-        mapping_state = "Complete"
         mapping_copy = f"{mapping_completed}/{mapping_total} sections are complete."
     elif active_stage == Stage.DATA_ENTRY and is_running:
-        mapping_state = "In progress"
         mapping_copy = f"{mapping_completed}/{mapping_total} sections are complete so far."
     else:
-        mapping_state = "Queued"
         mapping_copy = f"{mapping_completed}/{mapping_total} sections are ready."
 
     checks_done = checks_completed >= checks_total and checks_total > 0
     if checks_done:
-        checks_state = "Complete"
         checks_copy = f"{checks_completed}/{checks_total} final checks are complete."
     elif active_stage == Stage.FINANCIAL_CALCULATIONS and is_running:
-        checks_state = "In progress"
         checks_copy = f"{checks_completed}/{checks_total} final checks are complete so far."
     elif checks_started:
-        checks_state = "Queued"
         checks_copy = f"{checks_completed}/{checks_total} final checks are complete."
     else:
-        checks_state = "Queued"
         checks_copy = "Starts after all sections are entered."
 
     current_phase = display_workbook_phase_name(active_stage)
@@ -5309,14 +5303,7 @@ def render_workbook_stage() -> None:
         active_stage=active_stage,
         source_filename=source_filename,
         current_phase=current_phase,
-        workbook_message=workbook_message,
-        mapping_completed=mapping_completed,
-        mapping_total=mapping_total,
-        checks_completed=checks_completed,
-        checks_total=checks_total,
-        mapping_state=mapping_state,
         mapping_copy=mapping_copy,
-        checks_state=checks_state,
         checks_copy=checks_copy,
     )
 
@@ -5459,6 +5446,7 @@ def pop_entry_question_submission(job_id: str, question_signature: str) -> tuple
         return None, None, False
 
     if submission.get("job_id") != job_id or submission.get("question_signature") != question_signature:
+        st.session_state[QUESTION_TRANSITION_STATE_KEY] = None
         return None, None, False
 
     answer = submission.get("answer")
@@ -5481,11 +5469,79 @@ def pop_entry_question_resume() -> tuple[str | None, str | None, str | None]:
     return job_id, answer, source
 
 
-def render_entry_question_form(
+def store_entry_question_transition(
     result: ImportArtifacts,
     question_context: dict[str, str],
     *,
-    modal: bool,
+    question_signature: str,
+) -> None:
+    question = result.pending_question
+    if question is None:
+        return
+
+    st.session_state[QUESTION_TRANSITION_STATE_KEY] = {
+        "job_id": result.job_id,
+        "question_signature": question_signature,
+        "sheet_name": question.sheet_name,
+        "prompt": question.prompt,
+        "progress_text": question_context.get("progress_text", "Progress unavailable"),
+        "pdf_rereviewed": bool(question.pdf_rereviewed),
+    }
+
+
+def active_entry_question_transition(
+    *,
+    job_id: str | None = None,
+    question_signature: str | None = None,
+) -> dict[str, object] | None:
+    transition = st.session_state.get(QUESTION_TRANSITION_STATE_KEY)
+    if not isinstance(transition, dict):
+        return None
+
+    transition_job_id = transition.get("job_id")
+    transition_signature = transition.get("question_signature")
+    sheet_name = transition.get("sheet_name")
+    prompt = transition.get("prompt")
+    progress_text = transition.get("progress_text")
+    if not isinstance(transition_job_id, str) or not isinstance(sheet_name, str) or not isinstance(prompt, str):
+        st.session_state[QUESTION_TRANSITION_STATE_KEY] = None
+        return None
+    if job_id is not None and transition_job_id != job_id:
+        return None
+    if question_signature is not None and transition_signature != question_signature:
+        return None
+
+    return {
+        "job_id": transition_job_id,
+        "question_signature": transition_signature,
+        "sheet_name": sheet_name,
+        "prompt": prompt,
+        "progress_text": progress_text if isinstance(progress_text, str) else "Progress unavailable",
+        "pdf_rereviewed": bool(transition.get("pdf_rereviewed")),
+    }
+
+
+def render_entry_question_handoff(*, job_id: str | None = None, clear_after_render: bool = False) -> None:
+    transition = active_entry_question_transition(job_id=job_id)
+    if transition is None:
+        return
+
+    render_html_block(
+        build_entry_question_shell_markup(
+            sheet_name=str(transition["sheet_name"]),
+            prompt=str(transition["prompt"]),
+            progress_text=str(transition["progress_text"]),
+            pdf_rereviewed=bool(transition["pdf_rereviewed"]),
+            state="exiting",
+        )
+    )
+    if clear_after_render:
+        st.session_state[QUESTION_TRANSITION_STATE_KEY] = None
+
+
+def render_entry_question_form(
+    result: ImportArtifacts,
+    question_context: dict[str, str],
 ) -> tuple[str | None, str | None, bool]:
     question = result.pending_question
     if question is None:
@@ -5493,34 +5549,14 @@ def render_entry_question_form(
     question_signature = entry_question_signature(question)
     widget_keys = sync_entry_question_widget_state(result.job_id, question)
 
-    progress_chip = ""
-    if question_context["progress_text"] != "Progress unavailable":
-        progress_chip = f'<div class="question-chip">{html.escape(question_context["progress_text"])}</div>'
-
-    rereview_chip = ""
-    if question.pdf_rereviewed:
-        rereview_chip = '<div class="question-chip signal">Raw PDF re-reviewed</div>'
-
     render_html_block(
-        dedent(
-            f"""
-            <div class="question-shell {'is-modal' if modal else 'is-inline'}">
-                <div class="question-panel">
-                    <div class="question-header">
-                        <div class="question-header-row">
-                            <div class="question-kicker">Planner decision required</div>
-                            <div class="question-meta-strip">
-                                <div class="question-chip">{html.escape(question.sheet_name)}</div>
-                                {progress_chip}
-                                {rereview_chip}
-                            </div>
-                        </div>
-                        <h3 class="question-title">{html.escape(question.prompt)}</h3>
-                    </div>
-                </div>
-            </div>
-            """
-        ).strip()
+        build_entry_question_shell_markup(
+            sheet_name=question.sheet_name,
+            prompt=question.prompt,
+            progress_text=question_context["progress_text"],
+            pdf_rereviewed=question.pdf_rereviewed,
+            state="live",
+        )
     )
 
     with st.form(widget_keys["form"], border=False):
@@ -5537,8 +5573,8 @@ def render_entry_question_form(
                 options=option_labels,
                 index=0,
                 key=widget_keys["options"],
-                captions=None if modal else option_captions,
-                label_visibility="collapsed" if modal else "visible",
+                captions=option_captions,
+                label_visibility="visible",
                 width="stretch",
             )
             selected_option_value = option_values[selected_option_label]
@@ -5549,7 +5585,7 @@ def render_entry_question_form(
                 "Or write your own answer",
                 key=widget_keys["free_text"],
                 placeholder="Or type a custom answer",
-                label_visibility="collapsed" if modal else "visible",
+                label_visibility="visible",
             )
 
         submit_col, delegate_col = st.columns([0.64, 0.36], gap="small")
@@ -5580,9 +5616,11 @@ def render_entry_question_form(
     if answer is None or source is None:
         return None, None, False
 
-    if not modal:
-        return answer, source, True
-
+    store_entry_question_transition(
+        result,
+        question_context,
+        question_signature=question_signature,
+    )
     st.session_state[QUESTION_SUBMISSION_STATE_KEY] = {
         "job_id": result.job_id,
         "question_signature": question_signature,
@@ -5597,27 +5635,21 @@ def render_entry_question(result: ImportArtifacts) -> tuple[str | None, str | No
     if result.pending_question is None:
         return None, None, False
 
-    render_workbook_stage()
+    question_context = build_entry_question_context(result)
+    question_signature = entry_question_signature(result.pending_question)
     queued_submission = pop_entry_question_submission(
         result.job_id,
-        entry_question_signature(result.pending_question),
+        question_signature,
     )
     if queued_submission[2]:
+        render_entry_question_handoff(job_id=result.job_id)
+        render_workbook_stage()
         return queued_submission
 
-    question_context = build_entry_question_context(result)
-    dialog_renderer = getattr(st, "dialog", None)
-    if callable(dialog_renderer):
-
-        @dialog_renderer(QUESTION_DIALOG_TITLE, width="large", dismissible=False)
-        def render_entry_question_dialog() -> None:
-            render_entry_question_form(result, question_context, modal=True)
-
-        render_entry_question_dialog()
-        return None, None, False
-
-    st.markdown("<div style='height:0.85rem'></div>", unsafe_allow_html=True)
-    return render_entry_question_form(result, question_context, modal=False)
+    answer, source, submitted = render_entry_question_form(result, question_context)
+    if not submitted:
+        render_workbook_stage()
+    return answer, source, submitted
 
 
 def render_result(result: ImportArtifacts | None) -> None:
@@ -5696,8 +5728,10 @@ def render_work_area(work_placeholder, settings: Settings) -> tuple[object | Non
     run_started = bool(st.session_state.get("run_started"))
     status = st.session_state.get("last_status")
 
+    work_placeholder.empty()
     with work_placeholder.container():
         if is_running:
+            render_entry_question_handoff(clear_after_render=True)
             render_stage_focus()
             return None, None, None
 
@@ -5869,6 +5903,7 @@ def main() -> None:
                         "live_summary": None,
                         "live_summary_updated_at_ms": None,
                         "last_rendered_summary": None,
+                        "recent_events": [],
                     }
                 )
             st.rerun()

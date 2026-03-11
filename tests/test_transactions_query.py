@@ -5,6 +5,7 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
+from planlock.config import DEFAULT_TEMPLATE_PATH
 from planlock.transactions_query import (
     TransactionQueryService,
     build_query_transactions_tool,
@@ -104,3 +105,7 @@ def test_query_transactions_tool_returns_error_payload_for_non_read_only_sql(tmp
     assert payload["status"] == "error"
     assert "read-only" in payload["error"]
     assert has_transaction_data(workbook_path) is True
+
+
+def test_has_transaction_data_handles_locked_template_without_dimensions() -> None:
+    assert has_transaction_data(DEFAULT_TEMPLATE_PATH) is True

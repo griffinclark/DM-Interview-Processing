@@ -6,18 +6,24 @@ from openpyxl import Workbook
 
 import planlock.template_entry_agent as entry_agent_module
 from planlock.models import (
+    AgentAnswer,
     AgentQuestion,
     EntrySessionState,
     FieldCandidate,
     PageOcrResult,
     SheetEntryResult,
+    SheetEntrySummary,
     ValueKind,
 )
 from planlock.template_entry_agent import (
     LangGraphTemplateEntryAgent,
     answer_from_question,
+    default_sheet_order,
     read_sheet_context,
+    read_sheet_scaffold_context,
+    sheet_has_preloaded_template_data,
 )
+from planlock.template_schema import sheet_reference_for_prompt
 
 
 class FakeGraph:
@@ -214,6 +220,33 @@ def test_read_sheet_context_includes_all_populated_cells(monkeypatch, tmp_path: 
     assert len(context.splitlines()) == 206
 
 
+def test_read_sheet_scaffold_context_for_expenses_includes_headers_and_blank_column_a_note(
+    tmp_path: Path,
+) -> None:
+    workbook_path = tmp_path / "output.xlsx"
+    workbook = Workbook()
+    data_input = workbook.active
+    data_input.title = "Data Input"
+    expenses = workbook.create_sheet("Expenses")
+    expenses["B2"] = "Personal Expenses"
+    expenses["C4"] = "Yearly"
+    expenses["D4"] = "Monthly"
+    expenses["B5"] = "Home Expenses"
+    expenses["C5"] = '=SUM(C6:C12)'
+    expenses["D5"] = '=SUM(D6:D12)'
+    expenses["B13"] = "Auto / Commute"
+    workbook.save(workbook_path)
+
+    context = read_sheet_scaffold_context(workbook_path, "Expenses")
+
+    assert context is not None
+    assert "Locked template scaffold for Expenses" in context
+    assert "- row 2: B2 = Personal Expenses" in context
+    assert "- row 4: C4 = Yearly, D4 = Monthly" in context
+    assert "- row 5: B5 = Home Expenses, C5 = =SUM(C6:C12), D5 = =SUM(D6:D12)" in context
+    assert "- Column A starter rows 6-70 are blank in the locked template." in context
+
+
 def test_build_prompt_includes_preloaded_template_data_for_non_writable_sheets(
     monkeypatch,
     tmp_path: Path,
@@ -379,11 +412,86 @@ def test_expenses_prompt_uses_query_transactions_tool_instead_of_sample_rows(tmp
     prompt = agent._graph.prompts[0]  # type: ignore[attr-defined]
 
     assert updated_state.completed is True
+    assert "Expenses-specific guidance:" in prompt
+    assert "Treat Expenses as a block-based summary sheet" in prompt
+    assert "Do not ask the user to paste, screenshot, or transcribe labels from the active Expenses sheet." in prompt
+    assert "Locked template scaffold for Expenses" in prompt
+    assert "Column A starter rows 6-70 are blank in the locked template." in prompt
     assert "Tool available: `query_transactions`" in prompt
     assert "transactions_raw" in prompt
     assert "transactions_raw_cells" in prompt
     assert '"sheet_name": "Transactions Raw"' not in prompt
     assert '"account": "Amex Joint"' not in prompt
+
+
+def test_build_prompt_uses_step_context_and_deduped_retained_answers(tmp_path: Path) -> None:
+    workbook_path = tmp_path / "output.xlsx"
+    workbook = Workbook()
+    data_input = workbook.active
+    data_input.title = "Data Input"
+    data_input["C6"] = "Taylor"
+    workbook.create_sheet("Expenses")
+    workbook.save(workbook_path)
+
+    session_state = EntrySessionState(
+        job_id="job-123",
+        template_sha256="template-sha",
+        workbook_path=workbook_path,
+        ocr_results_path=tmp_path / "ocr_results.json",
+        current_sheet_index=1,
+        sheet_order=["Data Input", "Expenses"],
+        sheet_summaries=[
+            SheetEntrySummary(
+                sheet_name="Data Input",
+                status="completed",
+                message="Sheet entry completed.",
+            )
+        ],
+        user_answers=[
+            AgentAnswer(
+                question_id="expenses-category",
+                sheet_name="Expenses",
+                answer="Travel",
+                source="option",
+                affected_targets=["expenses.travel.monthly"],
+            ),
+            AgentAnswer(
+                question_id="expenses-category",
+                sheet_name="Expenses",
+                answer="Childcare",
+                source="free_text",
+                affected_targets=["expenses.travel.monthly"],
+            ),
+            AgentAnswer(
+                question_id="expenses-agent-choice",
+                sheet_name="Expenses",
+                answer="$1,250",
+                source="agent",
+                affected_targets=["expenses.travel.monthly"],
+            ),
+        ],
+    )
+
+    agent = object.__new__(LangGraphTemplateEntryAgent)
+    prompt = agent._build_prompt(  # type: ignore[attr-defined]
+        session_state=session_state,
+        ocr_results=_ocr_results(),
+        sheet_name="Expenses",
+        context_stage="workbook_only",
+    )
+
+    assert "Workflow step context:" in prompt
+    assert "- Step index: 2 of 2" in prompt
+    assert "- Active sheet: Expenses" in prompt
+    assert "- Resume mode: resumed after retaining a planner or agent answer" in prompt
+    assert "- Completed sheets so far: Data Input" in prompt
+    assert "- Remaining sheets after this pass: none" in prompt
+    assert "Prior transcript messages are intentionally dropped between passes." in prompt
+    assert "Retained planner answers for this sheet:" in prompt
+    assert "Retained agent decisions for this sheet:" in prompt
+    assert '"answer": "Childcare"' in prompt
+    assert '"answer": "$1,250"' in prompt
+    assert '"answer": "Travel"' not in prompt
 
 
 def test_advance_marks_preloaded_non_writable_sheet_as_template_seeded(tmp_path: Path) -> None:
@@ -410,6 +518,46 @@ def test_advance_marks_preloaded_non_writable_sheet_as_template_seeded(tmp_path:
     assert updated_state.sheet_summaries[0].status == "skipped"
     assert updated_state.sheet_summaries[0].message is not None
     assert "pre-populates this sheet with starter data" in updated_state.sheet_summaries[0].message
+
+
+def test_sheet_has_preloaded_template_data_ignores_net_worth_template_shell_without_data_rows(
+    tmp_path: Path,
+) -> None:
+    workbook_path = tmp_path / "output.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Net Worth"
+    sheet["B2"] = "Family Balance Sheet"
+    sheet["B4"] = "Assets"
+    sheet["B5"] = "Account"
+    sheet["C5"] = "Value"
+    sheet["B19"] = "Total Assets"
+    sheet["C19"] = "=SUM(C6:C18)"
+    sheet["B32"] = "Net Worth"
+    sheet["C32"] = "=C19-C30"
+    workbook.save(workbook_path)
+
+    assert sheet_has_preloaded_template_data(workbook_path, "Net Worth") is False
+
+
+def test_sheet_reference_for_prompt_describes_net_worth_blocks() -> None:
+    prompt = sheet_reference_for_prompt("Net Worth")
+
+    assert "Net worth blocks:" in prompt
+    assert "Assets: write account labels to B6:B18 and balances to C6:C18" in prompt
+    assert "Liabilities: write account labels to B22:B29 and balances to C22:C29" in prompt
+    assert "set `net_worth_section`" in prompt
+
+
+def test_default_sheet_order_excludes_transactions_raw() -> None:
+    assert default_sheet_order() == [
+        "Data Input",
+        "Net Worth",
+        "Expenses",
+        "Retirement Accounts",
+        "Taxable Accounts",
+        "Education Accounts",
+    ]
 
 
 def test_advance_reorders_sheet_order_to_start_with_data_input(tmp_path: Path) -> None:
