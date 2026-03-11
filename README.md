@@ -45,7 +45,7 @@ Required environment variables:
 OPENAI_API_KEY="your-key"
 ```
 
-Runtime settings now live in the app’s `Settings` modal. The defaults are:
+Runtime settings stay locked in code, and the app’s `Settings` modal currently exposes the parallel OCR lane count for the current browser session. The defaults are:
 
 ```bash
 LLM_PROVIDER="openai"
@@ -54,13 +54,13 @@ ANTHROPIC_MODEL="claude-sonnet-4-5-20250929"
 OCR_PARALLEL_WORKERS="3"
 LLM_TIMEOUT_SECONDS="120"
 LLM_MAX_RETRIES="2"
-LLM_RETRY_BASE_SECONDS="2"
-LLM_RETRY_MAX_SECONDS="12"
+LLM_RETRY_BASE_SECONDS="10"
+LLM_RETRY_MAX_SECONDS="300"
 MAX_PAGES="40"
 LOG_LEVEL="INFO"
 ```
 
-If you switch the runtime provider to `anthropic`, add `ANTHROPIC_API_KEY` to `.env`. Model choice is locked in code; the settings modal only exposes the provider.
+Anthropic support remains in the runtime plumbing, but this build keeps OpenAI active in the UI. If you want to switch providers, add `ANTHROPIC_API_KEY` to `.env` and change the default provider in code.
 
 The locked template path and checksum stay in code and are not exposed in the settings modal.
 
@@ -82,7 +82,7 @@ docker run --rm -p 8501:8501 \
   planlock
 ```
 
-To run with Anthropic instead, also pass `-e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"` and select `anthropic` in settings.
+To run with Anthropic instead, also pass `-e ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY"` and change the default provider in code before starting the app.
 
 The container includes LibreOffice so the app can attempt a headless recalculation pass during stage 3.
 
