@@ -315,6 +315,11 @@ def test_data_input_sheet_starts_with_compact_ocr_context(tmp_path: Path) -> Non
 
     assert updated_state.completed is True
     assert "Context stage: ocr_results" in prompt
+    assert "Data-Input-specific guidance:" in prompt
+    assert "Treat the `From Paycheck` inputs on this sheet as pay-period amounts, not annual totals." in prompt
+    assert "Populate `income.*.pay_periods_per_year` first whenever the source supports it" in prompt
+    assert "Check specifically for bonus, commission, RSUs, and severance" in prompt
+    assert "Only use annual totals for fields explicitly marked annual" in prompt
     assert "Structured OCR snippet" in prompt
     assert "RAW-PDF-ONLY-TOKEN" not in prompt
 

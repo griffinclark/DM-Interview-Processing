@@ -319,6 +319,16 @@ def touched_cells_for_assignments(assignments: list[CellAssignment], sheet_name:
 
 
 def sheet_specific_prompt_guidance(sheet_name: str) -> str:
+    if sheet_name == "Data Input":
+        return (
+            "Data-Input-specific guidance:\n"
+            "- Treat the `From Paycheck` inputs on this sheet as pay-period amounts, not annual totals.\n"
+            "- Populate `income.*.pay_periods_per_year` first whenever the source supports it, and make sure paycheck-derived income, deduction, and tax values align to that cadence.\n"
+            "- Do not write annualized values into paycheck-driven cells; the workbook annualizes those figures from the pay-period inputs.\n"
+            "- Check specifically for bonus, commission, RSUs, and severance, and map each one to its matching income row instead of rolling it into base salary or another income bucket.\n"
+            "- Only use annual totals for fields explicitly marked annual, such as savings targets ending in `_annual`.\n"
+        )
+
     if sheet_name == "Net Worth":
         return (
             "Net-Worth-specific guidance:\n"
