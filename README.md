@@ -1,6 +1,28 @@
 # HollyPlanner
 
-HollyPlanner is a Streamlit app that turns a planner-facing PDF financial plan into the locked Excel workbook shipped in this repository. The app is intentionally template-specific: it verifies the bundled workbook checksum before every run and fails final validation if the output workbook drifts outside the allowed write surface.
+HollyPlanner is the current tool name surfaced in the Streamlit UI and runtime traces. The Python package in this repository is `planlock`.
+
+HollyPlanner turns a planner-facing PDF financial plan into the locked Excel workbook shipped in this repository. The app is intentionally template-specific: it verifies the bundled workbook checksum before every run and fails final validation if the output workbook drifts outside the allowed write surface.
+
+## Docker Quick Start
+
+Docker is the fastest way to run HollyPlanner because the image already includes LibreOffice for headless recalculation.
+
+Build the image:
+
+```bash
+docker build -t hollyplanner .
+```
+
+Run it with your local `.env`:
+
+```bash
+docker run --rm -p 8501:8501 --env-file .env hollyplanner
+```
+
+Then open [http://localhost:8501](http://localhost:8501).
+
+If you want the container's job artifacts to remain on your machine after the container stops, mount `tmp/` from the repo into `/app/tmp` instead of relying on the container filesystem alone.
 
 ## Current Behavior
 
@@ -49,7 +71,7 @@ One important detail: the UI shows two top-level workflow stages, `Document revi
 - An `OPENAI_API_KEY` for the current default UI/runtime path
 - Optional: `soffice` on your local machine if you want LibreOffice-based recalculation during final review
 
-Anthropic runtime plumbing and tests still exist in the codebase, but the settings dialog forces OpenAI in this build. If you want Anthropic end-to-end, you need to change the code, not just `.env`.
+Anthropic runtime plumbing and tests still exist in the codebase, but the shipped settings dialog keeps OpenAI active for this build. If you want Anthropic end-to-end, you need to change the code, not just `.env`.
 
 ## Local Setup
 
@@ -82,6 +104,8 @@ Run the app:
 source .venv/bin/activate
 .venv/bin/streamlit run app.py
 ```
+
+`app.py` is a thin entrypoint that calls `planlock.streamlit_app.main()`.
 
 ## Runtime Defaults
 
@@ -123,24 +147,6 @@ UI download behavior is also conditional:
 - `review_report.json` is downloadable after finalization.
 - `filled_financial_plan.xlsx` is only offered as a download when the workbook passes formula and drift validation, even though a working workbook file may still exist on disk in the job directory.
 
-## Docker
-
-Build the image:
-
-```bash
-docker build -t hollyplanner .
-```
-
-Run it with your local `.env`:
-
-```bash
-docker run --rm -p 8501:8501 --env-file .env hollyplanner
-```
-
-Then open [http://localhost:8501](http://localhost:8501).
-
-The Docker image installs LibreOffice, so the container can attempt headless recalculation during final review.
-
 ## Testing
 
 Run the test suite from the virtual environment:
@@ -157,6 +163,8 @@ The current tests cover:
 - The `query_transactions` tool and its read-only SQL guardrails
 - Workbook writes, preserved formula surfaces, and template drift detection
 - Streamlit UI rendering, settings behavior, result/download states, and HTML-rendering helper usage
+
+There is also a Playwright smoke-check script at `tests/e2e/live_upload_check.playwright.js`, but it is not part of the default `pytest` run.
 
 ## Repository Assets
 
